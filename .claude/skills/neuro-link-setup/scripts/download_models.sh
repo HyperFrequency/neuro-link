@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download the three GGUF models neuro-link needs:
-#   1. Octen-Embedding-8B Q8_0 (server-side embedder, 4096-dim)
+#   1. Octen-Embedding-8B f16 (server-side embedder, 4096-dim)
 #   2. Qwen3-Reranker-0.6B Q8_0 (qmd reranker)
 #   3. qmd-query-expansion-1.7B Q4_K_M (qmd query expansion)
 #
@@ -24,10 +24,10 @@ fi
 # (qmd resolves hf:repo/file URIs and caches them itself; pre-warming
 #  saves 15+ minutes on first query)
 
-echo "1/3  Octen-Embedding-8B Q8_0 -> $MODELS_DIR"
+echo "1/3  Octen-Embedding-8B f16 -> $MODELS_DIR"
 huggingface-cli download \
   mradermacher/Octen-Embedding-8B-GGUF \
-  Octen-Embedding-8B.Q8_0.gguf \
+  Octen-Embedding-8B.f16.gguf \
   --local-dir "$MODELS_DIR" \
   --local-dir-use-symlinks False
 
@@ -50,7 +50,7 @@ huggingface-cli download \
 echo
 echo "Verifying sizes..."
 for f in \
-  "$MODELS_DIR/Octen-Embedding-8B.Q8_0.gguf" \
+  "$MODELS_DIR/Octen-Embedding-8B.f16.gguf" \
   "$QMD_CACHE_DIR/qwen3-reranker-0.6b-q8_0.gguf" \
   "$QMD_CACHE_DIR/qmd-query-expansion-1.7B-q4_k_m.gguf"
 do
