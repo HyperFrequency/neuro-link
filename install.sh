@@ -319,17 +319,30 @@ step "4/12  Build neuro-link Rust Server"
 # Not "cargo build --release -p neuro-link-server" (README lists that
 # form for the future workspace layout; the crate hasn't been split yet).
 
-if [[ -x "$BINARY_PATH" ]]; then
+CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+CARGO_INSTALLED_BIN="$CARGO_BIN_DIR/neuro-link"
+
+# Preferred: cargo install --path . --force. Places binary at
+# ~/.cargo/bin/neuro-link (already on PATH for Rust users), no sudo
+# required, no /usr/local/bin symlink maintenance. Older installs that
+# left a binary at server/target/release/neuro-link are still valid;
+# we short-circuit if either exists.
+if [[ -x "$CARGO_INSTALLED_BIN" ]]; then
+  ok "neuro-link binary already installed ($CARGO_INSTALLED_BIN)"
+  track_ok "neuro-link binary"
+elif [[ -x "$BINARY_PATH" ]]; then
   ok "neuro-link binary already built ($BINARY_PATH)"
+  info "Consider migrating: cd ${NLR_ROOT}/server && cargo install --path . --force  # drops the /usr/local/bin symlink requirement"
   track_ok "neuro-link binary"
 else
-  info "Building neuro-link (cargo build --release in server/)..."
-  if run_sh "cd '${NLR_ROOT}/server' && cargo build --release"; then
-    [[ $DRY_RUN -eq 0 && -x "$BINARY_PATH" ]] && ok "neuro-link built" || ok "neuro-link build (dry-run)"
+  info "Installing neuro-link (cargo install --path server — drops binary at $CARGO_INSTALLED_BIN, no sudo)..."
+  if run_sh "cd '${NLR_ROOT}/server' && cargo install --path . --force"; then
+    [[ $DRY_RUN -eq 0 && -x "$CARGO_INSTALLED_BIN" ]] && ok "neuro-link installed to $CARGO_INSTALLED_BIN" || ok "neuro-link install (dry-run)"
     track_ok "neuro-link binary"
+    info "MCP registration note: set ~/.claude.json mcpServers['neuro-link-recursive'].command = '$CARGO_INSTALLED_BIN' (replaces the legacy /usr/local/bin/neuro-link symlink)."
   else
     track_fail "neuro-link binary"
-    die "cargo build --release failed" "cd ${NLR_ROOT}/server && cargo build --release -v"
+    die "cargo install --path failed" "cd ${NLR_ROOT}/server && cargo install --path . --force -v"
   fi
 fi
 
@@ -522,7 +535,7 @@ elif [[ -x "$SETUP_SCRIPTS/download_models.sh" ]]; then
   # Quick check: if all three files are present, we can skip the script run
   # entirely (download_models.sh is idempotent but still hits HF API for
   # manifest verification, which is unnecessary when files are complete).
-  OCTEN="${NLR_ROOT}/models/Octen-Embedding-8B.Q8_0.gguf"
+  OCTEN="${NLR_ROOT}/models/Octen-Embedding-8B.f16.gguf"
   QWEN_RERANK="${HOME}/.cache/qmd/models/qwen3-reranker-0.6b-q8_0.gguf"
   QWEN_EXPAND="${HOME}/.cache/qmd/models/qmd-query-expansion-1.7B-q4_k_m.gguf"
   if [[ -s "$OCTEN" && -s "$QWEN_RERANK" && -s "$QWEN_EXPAND" ]]; then
@@ -552,7 +565,7 @@ step "9/12  llama-server for Octen (port 8400, as system service)"
 
 install_launchagent_mac() {
   local plist="$HOME/Library/LaunchAgents/com.neurolink.llama-server.plist"
-  local octen="$NLR_ROOT/models/Octen-Embedding-8B.Q8_0.gguf"
+  local octen="$NLR_ROOT/models/Octen-Embedding-8B.f16.gguf"
   local llama_bin
   llama_bin="$(command -v llama-server || echo /usr/local/bin/llama-server)"
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/neuro-link"
@@ -619,7 +632,7 @@ PLIST
 install_systemd_linux() {
   local unit_dir="$HOME/.config/systemd/user"
   local unit="$unit_dir/neurolink-llama-server.service"
-  local octen="$NLR_ROOT/models/Octen-Embedding-8B.Q8_0.gguf"
+  local octen="$NLR_ROOT/models/Octen-Embedding-8B.f16.gguf"
   local llama_bin
   llama_bin="$(command -v llama-server || echo /usr/local/bin/llama-server)"
   mkdir -p "$unit_dir"
@@ -659,7 +672,7 @@ elif ! command -v llama-server >/dev/null 2>&1; then
   track_warn "llama-server (binary missing)"
   warn "llama-server not on PATH — install llama.cpp (see check_prereqs output) and re-run"
 else
-  OCTEN="${NLR_ROOT}/models/Octen-Embedding-8B.Q8_0.gguf"
+  OCTEN="${NLR_ROOT}/models/Octen-Embedding-8B.f16.gguf"
   if [[ ! -s "$OCTEN" && $DRY_RUN -eq 0 ]]; then
     track_warn "llama-server (Octen model missing)"
     warn "Octen GGUF missing at $OCTEN — re-run step 8 (download_models.sh) first"
@@ -733,7 +746,7 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-step "12/12  Verify (status.sh)"
+step "12/16  Verify (status.sh)"
 # ═══════════════════════════════════════════════════════════════════════════
 # status.sh runs a fast health probe. It expects services to be up — note
 # that on a fresh install the neuro-link HTTP server (port 8787) and
@@ -750,6 +763,57 @@ if [[ -x "$STATUS_SCRIPT" ]]; then
     echo ""
     NLR_ROOT="$NLR_ROOT" "$STATUS_SCRIPT" || warn "status.sh reported some services as down (see above)"
   fi
+
+# ---- nlr-extension: pinelsp + Serena Pine mod ----
+step "13/16  pinelsp (clone + build + MCP register)"
+if [[ -x "$SETUP_SCRIPTS/install_pinelsp.sh" ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dry "$SETUP_SCRIPTS/install_pinelsp.sh"
+  else
+    DRY_RUN=$DRY_RUN "$SETUP_SCRIPTS/install_pinelsp.sh" || warn "install_pinelsp.sh reported errors"
+  fi
+else
+  warn "$SETUP_SCRIPTS/install_pinelsp.sh not found (skipping step 13)"
+fi
+
+step "14/16  Serena Pine mod (install + MCP env)"
+if [[ -x "$SETUP_SCRIPTS/install_serena_pine_mod.sh" ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dry "$SETUP_SCRIPTS/install_serena_pine_mod.sh"
+  else
+    SERENA_PINE_MOD_DIR="$NLR_ROOT/packages/serena-pine-mod"       DRY_RUN=$DRY_RUN "$SETUP_SCRIPTS/install_serena_pine_mod.sh" || warn "install_serena_pine_mod.sh reported errors"
+  fi
+else
+  warn "$SETUP_SCRIPTS/install_serena_pine_mod.sh not found (skipping step 14)"
+fi
+
+step "15/16  Verify extension (pinelsp + Serena)"
+if [[ -x "$SETUP_SCRIPTS/verify_nlr_extension.sh" ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dry "$SETUP_SCRIPTS/verify_nlr_extension.sh"
+  else
+    "$SETUP_SCRIPTS/verify_nlr_extension.sh" || warn "verify_nlr_extension.sh reported failures"
+  fi
+else
+  warn "$SETUP_SCRIPTS/verify_nlr_extension.sh not found (skipping step 15)"
+fi
+
+step "16/16  RefGraph + llm-wiki ingest (Qdrant + Neo4j)"
+# Populates Qdrant (embeddings of llm-wiki pages + per-symbol refgraph
+# nodes) and Neo4j (symbol graph + reasoning ontologies) from the
+# deep-tool-wiki + 02-KB-main content on disk. Idempotent. See
+# scripts/install_refgraph_ingest.sh and scripts/ingest_refgraph.py
+# for the implementation.
+if [[ -x "$SETUP_SCRIPTS/install_refgraph_ingest.sh" ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dry "$SETUP_SCRIPTS/install_refgraph_ingest.sh"
+  else
+    DRY_RUN=$DRY_RUN "$SETUP_SCRIPTS/install_refgraph_ingest.sh" || warn "install_refgraph_ingest.sh reported errors (services may not be up — re-run manually)"
+  fi
+else
+  warn "$SETUP_SCRIPTS/install_refgraph_ingest.sh not found (skipping step 16)"
+fi
+
 else
   warn "$STATUS_SCRIPT not found — skipping verification"
 fi
