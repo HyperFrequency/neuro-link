@@ -4,6 +4,9 @@ A self-contained bench harness that simulates real terminal sessions against the
 
 **Scope:** NOT the laptop's running stack. This harness spins up a separate throwaway runtime (per-scenario), exercises neuro-link end-to-end, captures every I/O + memory/state touch, and emits a report the monorepo-deploy skill consumes.
 
+> **Current status (batch run 20260422-hf-nq-deployable-a7c3 / U30):**
+> Only `README.md` and `run.py` are shipped on this feature branch. `scenarios/`, `conftest.py`, `fixtures/`, `state/`, `reports/` are scaffolded on-demand by later units (U44/U45 shakedown-author). `run.py` exits **non-zero (code 3)** when invoked with an empty `scenarios/` directory — silent PASS on no-scenarios is banned per the run's evidence bar.
+
 ```
 test-harness/
 ├── README.md                           # this file — contract + how to run

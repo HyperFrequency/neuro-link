@@ -105,6 +105,18 @@ def main() -> int:
         print(f"available: {', '.join(available)}", file=sys.stderr)
         return 2
 
+    if not to_run:
+        print(
+            f"ERROR: no scenarios to execute. scenarios/ is empty at {SCENARIOS}.",
+            file=sys.stderr,
+        )
+        print(
+            "Populate scenarios/*.py before invoking run.py --scenario all. "
+            "Silently exiting 0 on empty is banned (evidence-bar).",
+            file=sys.stderr,
+        )
+        return 3
+
     failures = 0
     for name in to_run:
         result = run_scenario(name, args.runtime, args.target)
