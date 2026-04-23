@@ -1,0 +1,8 @@
+{
+  // llm-wiki vault conventions (mirrors deep-tool-wiki/.markdownlint.jsonc)
+  "default": true,
+  "MD013": false,
+  "MD025": false,
+  "MD040": false,
+  "MD060": false
+}

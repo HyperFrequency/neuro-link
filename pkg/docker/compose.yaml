@@ -1,0 +1,98 @@
+# neuro-link docker compose — dev profile (default) and prod profile
+# No `version:` key — Compose v2 ignores it.
+
+x-nlr-env: &nlr-env
+  NLR_ROOT: /app
+  NLR_MODELS_DIR: /app/models
+  QMD_CACHE_DIR: /root/.cache/qmd/models
+  DEEP_TOOL_WIKI_DIR: /app/deep-tool-wiki
+  LLM_WIKI_DIR: /app/02-KB-main
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.11.3
+    ports: ["6333:6333"]
+    volumes: ["qdrant-data:/qdrant/storage"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  neo4j:
+    image: neo4j:5.23-community
+    ports: ["7474:7474", "7687:7687"]
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes: ["neo4j-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p $${NEO4J_PASSWORD} 'RETURN 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+
+  litellm-proxy:
+    build: { context: ../.., dockerfile: pkg/docker/Dockerfile.litellm }
+    ports: ["4000:4000"]
+    environment:
+      <<: *nlr-env
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    depends_on: { qdrant: { condition: service_healthy } }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  ingest:
+    build: { context: ../.., dockerfile: pkg/docker/Dockerfile.ingest }
+    environment:
+      <<: *nlr-env
+    volumes:
+      - ../../..:/app:ro
+      - models-cache:/app/models
+      - qmd-cache:/root/.cache/qmd
+    depends_on:
+      qdrant: { condition: service_healthy }
+      neo4j: { condition: service_healthy }
+    profiles: ["ingest"]
+
+  optuna-dashboard:
+    image: python:3.12-slim
+    command: >
+      bash -c "pip install --quiet optuna optuna-dashboard &&
+               optuna-dashboard --host 0.0.0.0 --port 8080 sqlite:////studies/optuna.db"
+    ports: ["8080:8080"]
+    volumes: ["optuna-studies:/studies"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  vbtpro-dashboard:
+    build: { context: ../.., dockerfile: pkg/docker/Dockerfile.vbtpro }
+    ports: ["8501:8501"]
+    environment:
+      <<: *nlr-env
+    profiles: ["dashboards"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  qdrant-data:
+  neo4j-data:
+  models-cache:
+  qmd-cache:
+  optuna-studies:
