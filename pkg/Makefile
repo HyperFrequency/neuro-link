@@ -14,7 +14,7 @@
 #   proof             — aggregate .ready.json files into pkg/.proof/ALL.ready.json
 #   clean             — remove dist/ and .proof/
 
-.PHONY: all macos linux-x86_64 linux-aarch64 docker cloud-modal cloud-lambda cloud-ray models dashboards proof clean
+.PHONY: all local mac-only macos linux linux-x86_64 linux-aarch64 docker cloud cloud-modal cloud-lambda cloud-ray models dashboards proof clean
 
 VERSION ?= $(shell git describe --tags --always --dirty)
 ROOT := $(shell git rev-parse --show-toplevel)
@@ -27,7 +27,20 @@ $(PROOF_DIR):
 $(DIST_DIR):
 	mkdir -p $(DIST_DIR)
 
+# `all`   — every target (including cloud); skipped_no_creds will mark cloud deferred
+# `local` — mac + docker + both linux targets (no cloud). green_excluding_skipped iff all 4 ready
+# `mac-only` — just macos + proof (fast iteration)
+# `linux` — both linux cross-compile targets + proof
+# `cloud` — just the 3 cloud deploys (requires MODAL_TOKEN_ID / LAMBDA_CLOUD_API_KEY / AWS creds)
 all: macos linux-x86_64 linux-aarch64 docker cloud-modal cloud-lambda cloud-ray proof
+
+local: macos linux-x86_64 linux-aarch64 docker proof
+
+mac-only: macos proof
+
+linux: linux-x86_64 linux-aarch64 proof
+
+cloud: cloud-modal cloud-lambda cloud-ray proof
 
 macos: $(PROOF_DIR) $(DIST_DIR)
 	@bash pkg/macos/build.sh $(VERSION) | tee $(PROOF_DIR)/macos-arm64.log

@@ -11,6 +11,7 @@ state != "stub".
 """
 from __future__ import annotations
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,11 +43,35 @@ def discover_targets(root: Path) -> list[str]:
     return sorted(set(EXPECTED_TARGETS) | found)
 
 
+def _discover_run_id(proof_dir: Path) -> str:
+    """Resolve run_id from (in priority): NLR_RUN_ID env → parent run_id.txt
+    → parent checkpoint.md `run_id:` key → 'unknown-run'. Falls back only when
+    no source provides a value."""
+    env = os.environ.get("NLR_RUN_ID")
+    if env:
+        return env
+    # Walk up from proof_dir looking for run_id.txt or checkpoint.md
+    p = proof_dir.resolve()
+    for cand in [p, *p.parents]:
+        rid_file = cand / "run_id.txt"
+        if rid_file.is_file():
+            rid = rid_file.read_text().strip()
+            if rid:
+                return rid
+        chk = cand / "checkpoint.md"
+        if chk.is_file():
+            for line in chk.read_text().splitlines():
+                if line.strip().startswith("run_id:"):
+                    return line.split(":", 1)[1].strip()
+    return "unknown-run"
+
+
 def main(proof_dir: str) -> int:
     root = Path(proof_dir)
     root.mkdir(parents=True, exist_ok=True)
+    run_id = _discover_run_id(root)
     report: dict[str, object] = {
-        "run_id": "20260424-hf-monorepo-deploy-278fae",
+        "run_id": run_id,
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "targets": {},
         "state_counts": {},

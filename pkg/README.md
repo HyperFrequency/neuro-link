@@ -17,37 +17,50 @@ pkg/
 
 ## Build contract — READY-TO-USE proof per target
 
-Each target, when green, produces `pkg/.proof/<target>.ready.json`:
+Each target, when green, produces `pkg/.proof/<target>.ready.json`. The concrete
+schema varies by target type (tarball vs docker image vs cloud deploy), but
+every per-target proof includes at minimum: `target`, `state`, `version`,
+`target_arch`, `smoke_tests[]`, `timestamp`. Examples:
 
-```json
-{
-  "target": "macos-arm64",
-  "version": "0.x.y",
-  "artifact": "dist/neuro-link-0.x.y-arm64.pkg",
-  "sha256": "...",
-  "smoke_tests": [{"name": "cli_help", "exit_code": 0, "stdout_head": "..."}],
-  "models_present": ["Octen-Embedding-8B.Q8_0.gguf", "qwen3-reranker-0.6b-q8_0.gguf", "qmd-query-expansion-1.7B-q4_k_m.gguf"],
-  "dashboards_reachable": {"optuna-dashboard": "http://localhost:8080", "vbtpro-dashboard": "http://localhost:8501"},
-  "timestamp": "<ISO8601>"
-}
-```
+Tarball targets (macos-arm64, linux-x86_64, linux-aarch64) also emit
+`artifact` (path to `dist/<name>.tar.gz`), `sha256`, and a `binary_*` group
+(`binary_arch`, `binary_sha256`, `binary_file`).
 
-Absence of a `.ready.json` file means the target is NOT green. The skill refuses to stamp READY-TO-USE without every expected `.ready.json` present.
+Docker target emits `artifact: "docker://<tag>"`, `sha256: <image_id>`, plus
+`image`, `image_size_bytes`, `image_arch`, `built_from`.
+
+Cloud targets (modal/lambda/ray) emit `state:"ready"` with an `artifact` URL
+when creds are present, or `state:"skipped_no_creds"` with a `creds_probe`
+block (boolean-only, never reads values) when creds are absent — per
+fork-F2 honest-deferred policy.
+
+`pkg/.proof/ALL.ready.json` is the aggregate. It has two green flags:
+- `green`: all 7 targets `"ready"` (strict — requires cloud creds)
+- `green_excluding_skipped`: all non-skipped targets `"ready"` (deferred OK)
+
+The aggregator exits 0 iff `green_excluding_skipped: true`.
 
 ## Model triple (required on every target)
 
-See `.batch-runs/20260422-hf-nq-deployable-a7c3/research/api-pins.md` §Model triple for canonical identifiers.
+The model manifest lives at `<target-staging>/models-manifest/manifest.json`
+inside each installer. Canonical identifiers:
 
-- Octen-Embedding-8B (Q8_0 GGUF, 4096-dim; BF16 safetensors variant available for FP16 cast)
-- Qwen3-Reranker-0.6B (Q8_0 GGUF, stored in `~/.cache/qmd/models/`)
-- qmd-query-expansion-1.7B (Q4_K_M GGUF, stored in `~/.cache/qmd/models/`)
+- **Octen-Embedding-8B** — `mradermacher/Octen-Embedding-8B-GGUF`, file
+  `Octen-Embedding-8B.f16.gguf`, dest `~/neuro-link-models/`. 4096-dim;
+  BF16 safetensors variant available for FP16 cast.
+- **Qwen3-Reranker-0.6B** — `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF`, file
+  `qwen3-reranker-0.6b-q8_0.gguf`, dest `~/.cache/qmd/models/`.
+- **qmd-query-expansion-1.7B** — `tobil/qmd-query-expansion-1.7B-gguf`,
+  file `qmd-query-expansion-1.7B-q4_k_m.gguf`, dest `~/.cache/qmd/models/`.
 
-Every installer MUST pre-download or fetch-on-first-run. No manual steps.
+Every installer stages the manifest.json; per-target `postinstall.sh`
+scripts fetch-on-first-run. No manual steps.
 
-## Dashboards (required on every target)
+## Dashboards (optional, not part of the build-contract proof)
 
-- **optuna-dashboard** — `pip install optuna-dashboard`, launch `optuna-dashboard sqlite:///<study.db>` on :8080. Installer adds a launcher unit (systemd on linux, LaunchAgent on macOS, modal-scheduled on cloud).
-- **vectorbtpro dashboard** — no first-party dashboard; default = scaffold a minimal Plotly Dash app over `vbt.Portfolio` on :8501. Confirm this interpretation with user before shipping.
+Dashboards (optuna-dashboard on :8080, Plotly-Dash vbtpro overview on :8501)
+are brought up by the Phase 6 shakedown step, not by `make all`. Health
+checks on them are shakedown concerns, not READY-TO-USE proof fields.
 
 ## Dependency hell policy
 
