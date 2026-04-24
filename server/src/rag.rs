@@ -42,8 +42,151 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
+
+// ============================================================================
+// R+4 P-R4-A — query-embed LRU cache
+// ============================================================================
+//
+// The R+3 live probe measured Octen-8B query embedding at 3376ms mean per call
+// — 94% of total RAG latency. Repeat queries (common in agent workflows that
+// re-ask similar things within a session) shouldn't pay that cost every time.
+//
+// Design:
+// - `moka::future::Cache<String, Arc<Vec<f32>>>` — thread-safe by construction,
+//   no Arc<Mutex> contention on tokio's multi-thread runtime.
+// - Key = hex(sha256(model || \0 || query)). Prefixing with model is mandatory:
+//   Octen-8B (4096-dim) and Qwen3-0.6B (1024-dim) produce incompatible vectors,
+//   and qdrant collections require exact-dim matches. Collisions across model
+//   namespaces would poison Path A or Path B silently.
+// - Value wrapped in `Arc` so cache hits don't memcpy ~16KB (4096 × f32) per
+//   lookup — moka returns a clone of the value, and cloning an Arc is a
+//   refcount bump.
+// - Capacity 1000, TTL 1h (per R+4 spec). Disabled by `NLR_EMBED_CACHE_OFF=1`.
+// - Instrumented via `tracing::debug!` on every call with hit/miss + key prefix
+//   + query length. No value logging (embeddings are noise; query text could
+//   be sensitive).
+
+/// Lazily-initialized process-wide cache handle. `OnceLock` ensures a single
+/// moka `Cache` is shared across all callers (both `search_wiki` and
+/// `octen_search`), which is what makes repeat-query hits possible.
+static EMBED_CACHE: std::sync::OnceLock<moka::future::Cache<String, Arc<Vec<f32>>>> =
+    std::sync::OnceLock::new();
+
+/// Cache capacity — up to 1000 distinct (model, query) pairs.
+const EMBED_CACHE_CAPACITY: u64 = 1000;
+/// Default TTL — 1 hour. Overridable for tests via `embed_cache_for_tests`.
+const EMBED_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// Get (or lazily build) the default process-wide embed cache.
+fn embed_cache() -> &'static moka::future::Cache<String, Arc<Vec<f32>>> {
+    EMBED_CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(EMBED_CACHE_CAPACITY)
+            .time_to_live(EMBED_CACHE_TTL)
+            .build()
+    })
+}
+
+/// Is the cache disabled by env override? Checked per-call (cheap env read),
+/// so flipping `NLR_EMBED_CACHE_OFF=1` takes effect without restart in tests.
+fn embed_cache_disabled() -> bool {
+    std::env::var("NLR_EMBED_CACHE_OFF")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Cache key = `sha256(model || \0 || query)` hex, prefixed by model to keep
+/// different-dim embedders from colliding.
+fn embed_cache_key(model: &str, query: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(model.as_bytes());
+    hasher.update([0u8]); // separator — prevents length-extension collisions
+    hasher.update(query.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// POST a single query to an OpenAI-compatible embeddings endpoint and parse
+/// the first vector from the response. Split out so tests can mock it.
+async fn fetch_embedding_uncached(
+    http: &reqwest::Client,
+    query: &str,
+    embedding_url: &str,
+    embedding_model: &str,
+) -> Result<Vec<f32>> {
+    let resp = http
+        .post(embedding_url)
+        .json(&serde_json::json!({
+            "model": embedding_model,
+            "input": query,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("POST {embedding_url} (cached_embed)"))?
+        .error_for_status()
+        .with_context(|| format!("{embedding_url} returned non-2xx"))?;
+    let body: serde_json::Value = resp.json().await?;
+    parse_openai_embedding(&body)
+}
+
+/// Entry point used by both RAG paths. Returns an `Arc<Vec<f32>>` so the
+/// caller pays only a refcount bump on a hit (not a 16KB memcpy).
+///
+/// Cache semantics:
+/// - `NLR_EMBED_CACHE_OFF=1` → always hit the HTTP endpoint, never store.
+/// - otherwise: sha256-keyed lookup; miss populates the cache.
+///
+/// Emits one `tracing::debug!` per call so ops can verify hit-rate in prod.
+pub(crate) async fn cached_embed(
+    http: &reqwest::Client,
+    query: &str,
+    embedding_url: &str,
+    embedding_model: &str,
+) -> Result<Arc<Vec<f32>>> {
+    if embed_cache_disabled() {
+        let vec = fetch_embedding_uncached(http, query, embedding_url, embedding_model).await?;
+        tracing::debug!(
+            "embed cache: hit=false key=disabled query_len={}",
+            query.chars().count()
+        );
+        return Ok(Arc::new(vec));
+    }
+
+    let cache = embed_cache();
+    let key = embed_cache_key(embedding_model, query);
+    let key_prefix: String = key.chars().take(8).collect();
+    let query_len = query.chars().count();
+
+    if let Some(hit) = cache.get(&key).await {
+        tracing::debug!(
+            "embed cache: hit=true key={} query_len={}",
+            key_prefix,
+            query_len
+        );
+        return Ok(hit);
+    }
+
+    let vec = fetch_embedding_uncached(http, query, embedding_url, embedding_model).await?;
+    let arc = Arc::new(vec);
+    cache.insert(key, arc.clone()).await;
+    tracing::debug!(
+        "embed cache: hit=false key={} query_len={}",
+        key_prefix,
+        query_len
+    );
+    Ok(arc)
+}
+
+/// Test-only access to the default cache — lets tests assert eviction /
+/// population behavior without reaching into `EMBED_CACHE` directly.
+#[cfg(test)]
+fn default_cache_for_tests() -> &'static moka::future::Cache<String, Arc<Vec<f32>>> {
+    embed_cache()
+}
 
 /// One hit from `qmd search`. Mirrors qmd 0.1.2's stdout schema.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -206,20 +349,11 @@ pub async fn octen_search(
     collection: &str,
     rerank_url: Option<&str>,
 ) -> Result<Vec<OctenHit>> {
-    // 1. Embed query via llama-server :8400 (Octen-8B, 4096-dim)
-    let embed_resp = http
-        .post(embedding_url)
-        .json(&serde_json::json!({
-            "model": embedding_model,
-            "input": query,
-        }))
-        .send()
-        .await
-        .with_context(|| format!("POST {embedding_url} (query embed)"))?
-        .error_for_status()
-        .with_context(|| format!("{embedding_url} returned non-2xx"))?;
-    let embed_body: serde_json::Value = embed_resp.json().await?;
-    let vector = parse_openai_embedding(&embed_body)?;
+    // 1. Embed query via llama-server :8400 (Octen-8B, 4096-dim).
+    //    R+4 P-R4-A: goes through `cached_embed`, so repeat queries reuse a
+    //    cached f32 vec and skip the ~3.4s Octen forward pass entirely.
+    let vector_arc = cached_embed(http, query, embedding_url, embedding_model).await?;
+    let vector: &[f32] = vector_arc.as_slice();
 
     // 2. Qdrant top-K (over-fetch if reranking; rerank narrows)
     let fetch_k = if rerank_url.is_some() {
@@ -517,5 +651,206 @@ mod tests {
         let p3 = serde_json::json!({"foo": "bar"});
         // Falls through to JSON stringification
         assert!(payload_to_rerank_text(&p3).contains("foo"));
+    }
+
+    // ========================================================================
+    // R+4 P-R4-A — query-embed LRU cache tests
+    // ========================================================================
+    //
+    // These tests exercise the cache in isolation from HTTP: we build a
+    // local moka cache with the same shape as the production one and drive
+    // it through the same key/value discipline used in `cached_embed`. That
+    // keeps the tests pure (no network, no global-state pollution of
+    // `EMBED_CACHE`, which would leak across tests run in the same process).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal local cache factory with identical semantics to production
+    /// modulo TTL (tests override TTL to assert expiry quickly).
+    fn test_cache(ttl: Duration) -> moka::future::Cache<String, Arc<Vec<f32>>> {
+        moka::future::Cache::builder()
+            .max_capacity(EMBED_CACHE_CAPACITY)
+            .time_to_live(ttl)
+            .build()
+    }
+
+    /// Stand-in for `fetch_embedding_uncached` that returns a deterministic
+    /// vector per (model, query) pair and counts how many times it was
+    /// called. Used to prove that cache hits short-circuit the HTTP path.
+    async fn mock_fetch(
+        model: &str,
+        query: &str,
+        call_count: &AtomicUsize,
+    ) -> Arc<Vec<f32>> {
+        call_count.fetch_add(1, Ordering::SeqCst);
+        // Tiny "embedding": [len(query), len(model), query_hash_byte_0, ...].
+        // Deterministic per (model, query), distinct across pairs.
+        let bytes = embed_cache_key(model, query);
+        let first_byte = u8::from_str_radix(&bytes[0..2], 16).unwrap_or(0);
+        Arc::new(vec![
+            query.len() as f32,
+            model.len() as f32,
+            first_byte as f32,
+        ])
+    }
+
+    /// Wrap the same cache-or-fetch logic that `cached_embed` uses, but
+    /// against `mock_fetch` + an injectable cache. This mirrors the
+    /// production control flow 1:1; any divergence from production here
+    /// would be a test-coverage bug.
+    async fn cached_embed_local(
+        cache: &moka::future::Cache<String, Arc<Vec<f32>>>,
+        model: &str,
+        query: &str,
+        disabled: bool,
+        call_count: &AtomicUsize,
+    ) -> Arc<Vec<f32>> {
+        if disabled {
+            return mock_fetch(model, query, call_count).await;
+        }
+        let key = embed_cache_key(model, query);
+        if let Some(hit) = cache.get(&key).await {
+            return hit;
+        }
+        let arc = mock_fetch(model, query, call_count).await;
+        cache.insert(key, arc.clone()).await;
+        arc
+    }
+
+    #[tokio::test]
+    async fn cache_hit_returns_same_vector_as_miss() {
+        let cache = test_cache(Duration::from_secs(60));
+        let calls = AtomicUsize::new(0);
+        let a = cached_embed_local(&cache, "octen-8b", "what is foo", false, &calls).await;
+        let b = cached_embed_local(&cache, "octen-8b", "what is foo", false, &calls).await;
+        assert_eq!(&*a, &*b, "cached value must equal original");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second call must not refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_same_query_reuses_inner_fn_once() {
+        let cache = test_cache(Duration::from_secs(60));
+        let calls = AtomicUsize::new(0);
+        for _ in 0..5 {
+            let _ = cached_embed_local(&cache, "octen-8b", "repeat me", false, &calls).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "5 identical queries → 1 fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_different_queries_get_distinct_entries() {
+        let cache = test_cache(Duration::from_secs(60));
+        let calls = AtomicUsize::new(0);
+        let a = cached_embed_local(&cache, "octen-8b", "query one", false, &calls).await;
+        let b = cached_embed_local(&cache, "octen-8b", "query two", false, &calls).await;
+        assert_ne!(&*a, &*b, "distinct queries → distinct vectors");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // Different model, same query → also distinct key (model namespacing).
+        let c = cached_embed_local(&cache, "qwen3-0.6b", "query one", false, &calls).await;
+        assert_ne!(&*a, &*c, "same query, different model → distinct entry");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn cache_ttl_expires_entries() {
+        // 50ms TTL so the test finishes in well under a second. moka
+        // evicts lazily on access, so we also call `run_pending_tasks`
+        // to force the time check.
+        let cache = test_cache(Duration::from_millis(50));
+        let calls = AtomicUsize::new(0);
+        let _ = cached_embed_local(&cache, "m", "q", false, &calls).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Wait past TTL. tokio::time::sleep keeps the runtime happy.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        cache.run_pending_tasks().await;
+
+        let _ = cached_embed_local(&cache, "m", "q", false, &calls).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "TTL-expired entry must refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_disabled_always_hits_inner_fn() {
+        let cache = test_cache(Duration::from_secs(60));
+        let calls = AtomicUsize::new(0);
+        for _ in 0..4 {
+            let _ = cached_embed_local(&cache, "m", "q", true, &calls).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "disabled cache → every call refetches"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_eviction_at_capacity_plus_one() {
+        // Use a tiny capacity so the test is cheap. moka's `max_capacity`
+        // is weighted (default weigher = 1 per entry), so a capacity of 4
+        // admits 4 entries and evicts on the 5th. This mirrors the prod
+        // semantics (just scaled down from 1000 so it runs in <100ms).
+        let cache: moka::future::Cache<String, Arc<Vec<f32>>> =
+            moka::future::Cache::builder()
+                .max_capacity(4)
+                .time_to_live(Duration::from_secs(60))
+                .build();
+        let calls = AtomicUsize::new(0);
+        // Populate N+1 distinct keys.
+        for i in 0..5 {
+            let q = format!("query {i}");
+            let _ = cached_embed_local(&cache, "m", &q, false, &calls).await;
+        }
+        // Force moka's background eviction to run so entry_count is exact.
+        cache.run_pending_tasks().await;
+        assert!(
+            cache.entry_count() <= 4,
+            "expected <= capacity (4) entries, got {}",
+            cache.entry_count()
+        );
+
+        // Refetching "query 0" should now be a miss (it was the first
+        // inserted, so it's the most-likely evictee under moka's
+        // TinyLFU policy with cold cache).
+        let pre_calls = calls.load(Ordering::SeqCst);
+        let _ = cached_embed_local(&cache, "m", "query 0", false, &calls).await;
+        let post_calls = calls.load(Ordering::SeqCst);
+        // At least one of the original 5 queries must have been evicted —
+        // we observe this indirectly: refetching that exact evicted entry
+        // bumps the counter. We assert the cache did not exceed capacity,
+        // which is the concrete invariant the R+4 spec cares about.
+        let _ = (pre_calls, post_calls); // exact-evictee assertion is policy-dep
+    }
+
+    #[tokio::test]
+    async fn cache_key_namespace_by_model() {
+        // Direct hash-key test: the model prefix + NUL separator must
+        // produce distinct keys for (m1, "ab") vs (m1 + "a", "b"), which
+        // would otherwise collide on a naive `model + query` concatenation.
+        let k1 = embed_cache_key("abc", "def");
+        let k2 = embed_cache_key("abcd", "ef");
+        assert_ne!(k1, k2, "NUL separator must prevent length-extension collisions");
+    }
+
+    #[tokio::test]
+    async fn default_cache_is_wired_up() {
+        // Smoke test: the production `embed_cache()` singleton builds
+        // without panic and accepts writes/reads. This catches regressions
+        // where someone changes `EMBED_CACHE` init order.
+        let cache = default_cache_for_tests();
+        let key = embed_cache_key("smoke", "test");
+        cache.insert(key.clone(), Arc::new(vec![1.0_f32, 2.0, 3.0])).await;
+        let got = cache.get(&key).await.expect("default cache lost our write");
+        assert_eq!(&*got, &vec![1.0_f32, 2.0, 3.0]);
     }
 }
