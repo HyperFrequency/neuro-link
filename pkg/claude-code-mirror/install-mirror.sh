@@ -102,11 +102,13 @@ if [[ -f "$SETTINGS" ]]; then
   BACKUP="$SETTINGS.bak.$(date +%s)"
   log "  backing up $SETTINGS → $BACKUP"
   run cp "$SETTINGS" "$BACKUP"
-  # Merge: template entries extend existing ones. Existing.permissions.allow
-  # is preserved by concatenating + deduping; hook event arrays are merged
-  # per-event (NOT overwritten — `.[0] * .[1]` replaces the RHS wholesale
-  # which would silently drop any hooks the user wired up outside the
-  # template, e.g. custom PostToolUse entries).
+  # Merge: template entries extend existing ones. permissions.allow is
+  # concatenated + deduped; hook event arrays are merged per-matcher
+  # (grouping entries by `.matcher` so custom + template entries that
+  # target the same matcher collapse into a single block with their
+  # nested `.hooks` arrays concatenated and deduped by `.command`).
+  # The earlier simpler `unique` on the outer array left duplicate
+  # matcher blocks, causing shared commands to fire twice on retry.
   MERGED=$(mktemp -t nlr-mirror-merged.XXXXXX.json)
   jq -s '
     .[0] as $existing | .[1] as $template |
@@ -119,7 +121,15 @@ if [[ -f "$SETTINGS" ]]; then
     | .permissions.allow = (($a + $b) | unique)
     | .hooks = (
         reduce $events[] as $e ({};
-          .[$e] = (($eh[$e] // []) + ($th[$e] // []) | unique)
+          .[$e] = (
+            (($eh[$e] // []) + ($th[$e] // []))
+            | group_by(.matcher)
+            | map(
+                { matcher: (.[0].matcher),
+                  hooks: (map(.hooks // []) | add | unique_by(.command)) }
+                | if .matcher == null then del(.matcher) else . end
+              )
+          )
         )
       )
     ' "$SETTINGS" "$TMP_RENDERED" > "$MERGED" || {
@@ -142,54 +152,81 @@ else
 fi
 
 # --- 5. Post-install MCP validation ---
-# install_mcp_servers.sh only registers the two neuro-link servers + turbovault;
-# serena is deliberately out-of-scope there because users often already have
-# it globally. Validate all three REQUIRED servers are present, auto-register
-# serena's canonical entry if missing, and exit 3 if anything remains unset.
+# Validate every REQUIRED MCP entry in ~/.claude.json is structurally
+# sound (object with non-empty .command string) AND operationally viable
+# (the resolved command is executable). Key-presence alone is not
+# enough: a stale entry left behind by an earlier install will pass
+# presence but fail at runtime, leaving the gate green and the stack
+# broken. Malformed/missing serena gets normalized to the canonical
+# shape from mcp-servers.yaml (~/.local/bin/serena-mcp, stdio, no args).
 CLAUDE_JSON="${HOME}/.claude.json"
 REQUIRED_MCP=("neuro-link-recursive" "neuro-link-http" "serena")
+
+_expand_cmd() {
+  # Expand the env-var placeholders we actually write into config
+  # (${HOME}, $HOME, leading ~). Exotic forms are intentionally left
+  # alone — they'll fail the -x check below, which is correct.
+  local v="$1"
+  v="${v//\$\{HOME\}/$HOME}"
+  v="${v//\$HOME/$HOME}"
+  v="${v/#~/$HOME}"
+  printf '%s' "$v"
+}
+
+is_mcp_entry_valid() {
+  local srv="$1"
+  jq -e --arg s "$srv" '
+    .mcpServers[$s] as $e
+    | if ($e | type) != "object" then false
+      elif ($e.command | type) != "string" then false
+      elif ($e.command | length) == 0 then false
+      else true end
+    ' "$CLAUDE_JSON" >/dev/null 2>&1 || return 1
+  local cmd
+  cmd=$(jq -r --arg s "$srv" '.mcpServers[$s].command' "$CLAUDE_JSON")
+  cmd="$(_expand_cmd "$cmd")"
+  if [[ "$cmd" == /* ]]; then
+    [[ -x "$cmd" ]]
+  else
+    command -v "$cmd" >/dev/null 2>&1
+  fi
+}
+
+collect_missing_mcp() {
+  local out=()
+  for srv in "${REQUIRED_MCP[@]}"; do
+    is_mcp_entry_valid "$srv" || out+=("$srv")
+  done
+  echo "${out[*]}"
+}
+
 if [[ "$DRY_RUN" == "1" ]]; then
-  log "DRY: would validate MCP servers: ${REQUIRED_MCP[*]}"
+  log "DRY: would validate MCP servers (structural + operational): ${REQUIRED_MCP[*]}"
 elif [[ ! -f "$CLAUDE_JSON" ]]; then
   log "ERROR: $CLAUDE_JSON does not exist — MCP registration failed upstream."
   exit 3
 else
-  missing_mcp() {
-    local out=()
-    for srv in "${REQUIRED_MCP[@]}"; do
-      if ! jq -e --arg s "$srv" '.mcpServers[$s]' "$CLAUDE_JSON" >/dev/null 2>&1; then
-        out+=("$srv")
-      fi
-    done
-    echo "${out[*]}"
-  }
-  MISSING="$(missing_mcp)"
+  MISSING="$(collect_missing_mcp)"
   if [[ " $MISSING " == *" serena "* ]]; then
-    log "  serena MCP absent from $CLAUDE_JSON — installing canonical entry via uvx"
+    log "  serena MCP missing or malformed in $CLAUDE_JSON — normalizing to canonical"
     cp "$CLAUDE_JSON" "$CLAUDE_JSON.bak.$(date +%s)"
-    SERENA_PATCH=$(mktemp -t nlr-serena-patch.XXXXXX.json)
-    cat > "$SERENA_PATCH" <<'JSON'
-{
-  "mcpServers": {
-    "serena": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server", "--context", "ide-assistant"]
-    }
-  }
-}
-JSON
-    jq -s '.[0] * .[1]' "$CLAUDE_JSON" "$SERENA_PATCH" > "$CLAUDE_JSON.new" \
-      && mv "$CLAUDE_JSON.new" "$CLAUDE_JSON"
-    rm -f "$SERENA_PATCH"
-    MISSING="$(missing_mcp)"
+    SERENA_ENTRY_JSON=$(jq -n --arg home "$HOME" '{
+      type: "stdio",
+      command: ($home + "/.local/bin/serena-mcp"),
+      args: []
+    }')
+    jq --argjson entry "$SERENA_ENTRY_JSON" '.mcpServers.serena = $entry' \
+      "$CLAUDE_JSON" > "$CLAUDE_JSON.new" && mv "$CLAUDE_JSON.new" "$CLAUDE_JSON"
+    MISSING="$(collect_missing_mcp)"
   fi
   if [[ -n "$MISSING" ]]; then
-    log "ERROR: required MCP servers still missing from $CLAUDE_JSON: $MISSING"
-    log "  Re-run install_mcp_servers.sh after fixing NLR_BIN/TV_BIN paths, or register manually with 'claude mcp add'."
+    log "ERROR: required MCP servers missing or not executable in $CLAUDE_JSON: $MISSING"
+    log "  For each failing server, confirm the .command path resolves to an executable file."
+    log "  Canonical serena binary: \$HOME/.local/bin/serena-mcp (install via 'pipx install serena-mcp')."
+    log "  Canonical neuro-link binaries: \$NLR_ROOT/server/target/release/neuro-link (cargo build --release in server/)."
     exit 3
   fi
-  log "  MCP validation OK: ${REQUIRED_MCP[*]}"
+  log "  MCP validation OK (structural + operational): ${REQUIRED_MCP[*]}"
 fi
 
 log "DONE. Review $SETTINGS and restart Claude Code to pick up hook changes."

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -253,6 +252,32 @@ def check_vaults_dir() -> dict[str, Any]:
     return _pass("vaults", f"{vaults_dir} + README.md present")
 
 
+def _detect_host_arch() -> str:
+    """Return the *hardware* arch — arm64, x86_64, or unknown.
+
+    `platform.machine()` reports the Python interpreter's arch, which on
+    Apple Silicon under Rosetta translation lies (returns x86_64 on arm64
+    hardware). `sysctl hw.optional.arm64` is hardware-state, not
+    process-state — unforgeable by Rosetta. Fall back to uname(1) for
+    Linux/BSD.
+    """
+    if sys.platform == "darwin":
+        rc, out = _run(["sysctl", "-n", "hw.optional.arm64"])
+        if rc == 0 and out.strip() == "1":
+            return "arm64"
+        if rc == 0 and out.strip() == "0":
+            return "x86_64"
+    rc, out = _run(["uname", "-m"])
+    if rc != 0:
+        return "unknown"
+    m = out.strip()
+    if m in ("arm64", "aarch64"):
+        return "arm64"
+    if m in ("x86_64", "amd64"):
+        return "x86_64"
+    return "unknown"
+
+
 def check_serena_arch() -> dict[str, Any]:
     if "serena-arch" in SKIP:
         return _skipped("serena-arch", "NLR_VERIFY_SKIP")
@@ -293,7 +318,7 @@ def check_serena_arch() -> dict[str, Any]:
     if rc != 0:
         return _fail("serena-arch", f"file(1) exit {rc} on {target}: {out[:200]}")
 
-    host_arch = platform.machine()
+    host_arch = _detect_host_arch()
     trail_s = " -> ".join(trail)
 
     if "arm64" in out:
@@ -304,10 +329,12 @@ def check_serena_arch() -> dict[str, Any]:
             f"x86_64-only binary at {target} (Rosetta) — reinstall with arch -arm64 python: {out[:160]}",
         )
 
-    # Unknown signature. On arm64 hosts the rag stack leans on Metal via
-    # an arm64-native interpreter; ambiguity here almost always means a
-    # misinstall (uv's cpython-3.11 is x86_64 on this host). Hard-fail
-    # instead of the prior warn so the gate actually catches it.
+    # Unknown signature. On arm64 *hardware* the rag stack leans on Metal
+    # via an arm64-native interpreter; ambiguity here almost always means
+    # a misinstall (uv's cpython-3.11 is x86_64 on this host). Hard-fail
+    # when the hardware is arm64 — note that we resolve host arch from
+    # sysctl, NOT platform.machine(), so a Rosetta-translated Python
+    # cannot bypass this branch.
     if host_arch == "arm64":
         return _fail(
             "serena-arch",
