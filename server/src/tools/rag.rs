@@ -7,6 +7,7 @@ use walkdir::WalkDir;
 
 use crate::bm25;
 use crate::embed;
+use crate::rag as rag_clients;
 use crate::tools::external;
 
 pub fn tool_defs() -> Vec<Value> {
@@ -45,6 +46,25 @@ pub fn call(name: &str, args: &Value, root: &Path) -> Result<String> {
             })
             .ok()
             .unwrap_or_default();
+
+            // R+3: opt-in rerank pass via warm Qwen3-Reranker (llama-server :8401).
+            // Enabled when NLR_RAG_RERANK_URL is set (typical value
+            // "http://localhost:8401/reranking"). Re-orders vector_results
+            // in place by the cross-encoder's relevance scores, then lets
+            // the downstream RRF merge use the improved ordering.
+            let vector_results = if let Ok(rurl) = std::env::var("NLR_RAG_RERANK_URL") {
+                if !rurl.trim().is_empty() && !vector_results.is_empty() {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            rerank_vector_results(&query, &rurl, vector_results).await
+                        })
+                    })
+                } else {
+                    vector_results
+                }
+            } else {
+                vector_results
+            };
 
             // 3) RRF merge of local sources (BM25 + vector)
             let local_merged = rrf_merge(&bm25_results, &vector_results, limit * 2);
@@ -148,6 +168,63 @@ pub fn call(name: &str, args: &Value, root: &Path) -> Result<String> {
 
         _ => bail!("Unknown rag tool: {name}"),
     }
+}
+
+/// Re-order `vector_results` using the Qwen3-Reranker at `rerank_url`.
+/// Non-fatal: any failure (server down, bad response, parse error) returns
+/// the input list unchanged so the query still succeeds on the original
+/// qdrant ordering. Writes a `tracing::warn!` on failure so ops can see
+/// when rerank is silently off.
+async fn rerank_vector_results(
+    query: &str,
+    rerank_url: &str,
+    vector_results: Vec<embed::SearchResult>,
+) -> Vec<embed::SearchResult> {
+    let http = reqwest::Client::new();
+    let docs: Vec<String> = vector_results
+        .iter()
+        .map(|r| {
+            // Rerank input: prefer preview text when present; fall back to
+            // path (keeps the cross-encoder grounded on content, not file
+            // location).
+            if !r.preview.is_empty() {
+                r.preview.clone()
+            } else {
+                r.path.clone()
+            }
+        })
+        .collect();
+    let scores = match rag_clients::run_qwen_rerank(&http, rerank_url, query, &docs).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "rag: rerank {} failed ({}); falling back to qdrant-only ordering",
+                rerank_url,
+                e
+            );
+            return vector_results;
+        }
+    };
+    // Pair each result with its rerank score, sort desc, return.
+    let mut paired: Vec<(embed::SearchResult, f32)> = vector_results
+        .into_iter()
+        .zip(scores.into_iter())
+        .collect();
+    paired.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    paired.into_iter().map(|(r, _)| r).collect()
+}
+
+async fn _rerank_dummy_for_integration() -> Result<()> {
+    // Suppresses unused-import warnings when RRF-rerank path is cold.
+    let _ = rag_clients::OctenHit {
+        id: String::new(),
+        vector_score: 0.0,
+        rerank_score: None,
+        payload: json!({}),
+    };
+    Ok(())
 }
 
 /// Reciprocal Rank Fusion: merges two ranked lists by path.
