@@ -55,7 +55,17 @@ done
 # invalid-but-present case before any write is the only way to
 # guarantee atomic retries.
 CLAUDE_JSON="${HOME}/.claude.json"
-REQUIRED_MCP=("neuro-link-recursive" "neuro-link-http" "serena")
+# Gate-10 BB1: serena moved from REQUIRED to OPTIONAL. Clean clones on
+# a real pristine host don't have ~/.local/bin/serena-mcp; install-mirror
+# used to exit 3 at post-install MCP validation on that host, blocking
+# `make all`. serena is genuinely high-value but not a hard dep — it's
+# installed separately via `pipx install serena-mcp`. Required servers
+# are only the two neuro-link ones that install_mcp_servers.sh itself
+# creates. Optional servers are auto-registered when missing AND their
+# binary is on disk; when the binary is absent, the installer skips
+# them with a notice instead of failing.
+REQUIRED_MCP=("neuro-link-recursive" "neuro-link-http")
+OPTIONAL_MCP=("serena")
 
 _expand_cmd() {
   # Expand the env-var placeholders we actually write into config
@@ -264,7 +274,7 @@ fi
 # canonical serena (the installer doesn't register serena itself), and
 # exit 3 if anything is still missing or somehow malformed post-merge.
 if [[ "$DRY_RUN" == "1" ]]; then
-  log "DRY: would validate MCP servers (structural + operational): ${REQUIRED_MCP[*]}"
+  log "DRY: would validate MCP servers — required: ${REQUIRED_MCP[*]}; optional: ${OPTIONAL_MCP[*]}"
 elif [[ ! -f "$CLAUDE_JSON" ]]; then
   log "ERROR: $CLAUDE_JSON does not exist — MCP registration failed upstream."
   exit 3
@@ -278,31 +288,37 @@ else
     esac
   done
 
-  # Auto-create canonical serena ONLY when the key is ABSENT entirely.
-  # If the user already has a serena entry that fails our validator, we
-  # report and exit instead of overwriting — their entry might be an
-  # intentional custom transport (uvx wrapper, alternate binary path,
-  # etc.) and silently replacing it is a destructive mutation.
-  if printf '%s\n' "${ABSENT_MCP[@]}" | grep -qx serena; then
-    log "  serena MCP absent from $CLAUDE_JSON — installing canonical entry"
-    cp "$CLAUDE_JSON" "$CLAUDE_JSON.bak.$(date +%s)"
-    SERENA_ENTRY_JSON=$(jq -n --arg home "$HOME" '{
-      type: "stdio",
-      command: ($home + "/.local/bin/serena-mcp"),
-      args: []
-    }')
-    jq --argjson entry "$SERENA_ENTRY_JSON" '.mcpServers.serena = $entry' \
-      "$CLAUDE_JSON" > "$CLAUDE_JSON.new" && mv "$CLAUDE_JSON.new" "$CLAUDE_JSON"
-    # Re-classify after the write
-    ABSENT_MCP=()
-    MALFORMED_MCP=()
-    for srv in "${REQUIRED_MCP[@]}"; do
-      case "$(classify_mcp "$srv")" in
-        absent)    ABSENT_MCP+=("$srv") ;;
-        malformed) MALFORMED_MCP+=("$srv") ;;
-      esac
-    done
-  fi
+  # Optional servers: try to auto-register when ABSENT and their binary
+  # is on disk. When the binary is absent (e.g. clean clone without
+  # `pipx install serena-mcp`), skip silently with a notice. When
+  # present-but-malformed, warn but don't fail the installer.
+  for opt in "${OPTIONAL_MCP[@]}"; do
+    case "$(classify_mcp "$opt")" in
+      absent)
+        case "$opt" in
+          serena)
+            if [[ -x "$HOME/.local/bin/serena-mcp" ]]; then
+              log "  optional serena MCP absent — canonical binary present, registering"
+              cp "$CLAUDE_JSON" "$CLAUDE_JSON.bak.$(date +%s)"
+              SERENA_ENTRY_JSON=$(jq -n --arg home "$HOME" '{
+                type: "stdio",
+                command: ($home + "/.local/bin/serena-mcp"),
+                args: []
+              }')
+              jq --argjson entry "$SERENA_ENTRY_JSON" '.mcpServers.serena = $entry' \
+                "$CLAUDE_JSON" > "$CLAUDE_JSON.new" && mv "$CLAUDE_JSON.new" "$CLAUDE_JSON"
+            else
+              log "  optional serena MCP absent — canonical binary missing, skipping (install via 'pipx install serena-mcp' then re-run)"
+            fi
+            ;;
+        esac
+        ;;
+      malformed)
+        log "  WARNING: optional MCP entry '$opt' present but failed validation — NOT auto-rewritten."
+        log "    Review \$CLAUDE_JSON.mcpServers.$opt; stdio needs executable .command, http/sse needs string .url matching ^https?://."
+        ;;
+    esac
+  done
 
   if (( ${#ABSENT_MCP[@]} > 0 )); then
     log "ERROR: required MCP servers absent from $CLAUDE_JSON: ${ABSENT_MCP[*]}"
@@ -312,14 +328,13 @@ else
     log "ERROR: required MCP servers present but failed validation in $CLAUDE_JSON: ${MALFORMED_MCP[*]}"
     log "  These entries were NOT auto-rewritten — they may be intentional non-canonical configs."
     log "  For each, check: stdio entries need an executable .command; http/sse entries need a string .url matching ^https?://"
-    log "  Canonical serena: type=stdio, command=\$HOME/.local/bin/serena-mcp (pipx install serena-mcp)."
     log "  Canonical neuro-link binaries: \$NLR_ROOT/server/target/release/neuro-link (cargo build --release in server/)."
     log "  Edit \$CLAUDE_JSON by hand to correct, then re-run."
   fi
   if (( ${#ABSENT_MCP[@]} > 0 )) || (( ${#MALFORMED_MCP[@]} > 0 )); then
     exit 3
   fi
-  log "  MCP validation OK (structural + operational): ${REQUIRED_MCP[*]}"
+  log "  MCP validation OK (structural + operational): required=[${REQUIRED_MCP[*]}] optional=[${OPTIONAL_MCP[*]}]"
 fi
 
 log "DONE. Review $SETTINGS and restart Claude Code to pick up hook changes."

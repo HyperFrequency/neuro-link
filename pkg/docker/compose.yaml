@@ -28,7 +28,14 @@ services:
     image: neo4j:5.23-community
     ports: ["7474:7474", "7687:7687"]
     environment:
-      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
+      # Gate-10 AA1: changed ${VAR:?} to ${VAR:-default} — compose
+      # interpolates all `${VAR:?}` references at config time regardless
+      # of which profile is active, so the strict form aborted
+      # `--profile rag` even though neo4j is behind `profiles: [full]`.
+      # neo4j itself refuses to start with a missing password, so the
+      # safety property is preserved; only the compose-parse failure
+      # was misleading.
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-neo4j-password-unset}"
       NEO4J_PLUGINS: '["apoc"]'
     volumes: ["neo4j-data:/data"]
     healthcheck:
@@ -47,8 +54,11 @@ services:
     ports: ["4000:4000"]
     environment:
       <<: *nlr-env
-      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?}"
-      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?}"
+      # Gate-10 AA1: ${VAR:?} → ${VAR:-} for same reason as neo4j above.
+      # litellm-proxy refuses to serve without real keys, so the failure
+      # surfaces at container startup instead of at `--profile rag` parse.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
     depends_on: { qdrant: { condition: service_healthy } }
     profiles: ["full"]
@@ -89,8 +99,14 @@ services:
     # mount aligned without relying on a shared shell env. Override by
     # exporting NLR_MODELS_DIR=/abs/path before BOTH `make models` and
     # `docker compose up`.
+    # Gate-10 AA2: optional env_file so a clean clone (no `make models`
+    # run yet) still parses the compose. When the manifest is absent,
+    # compose falls back to the inline ${OCTEN_VARIANT:-f16} /
+    # ${NLR_MODELS_DIR:-../../models} defaults below. Requires Docker
+    # Compose v2.24+ for the `required: false` syntax.
     env_file:
-      - ${NLR_MODELS_DIR:-../../models}/.octen-manifest.env
+      - path: ${NLR_MODELS_DIR:-../../models}/.octen-manifest.env
+        required: false
     command: >
       --embeddings
       --model /models/Octen-Embedding-8B.${OCTEN_VARIANT:-f16}.gguf
