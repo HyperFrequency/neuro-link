@@ -35,7 +35,12 @@ HOME = Path(os.environ["HOME"])
 SKIP = set(filter(None, os.environ.get("NLR_VERIFY_SKIP", "").split(",")))
 OFFLINE = os.environ.get("NLR_VERIFY_OFFLINE") == "1"
 
-REQUIRED_MCP_SERVERS = ["serena", "neuro-link-http", "neuro-link-recursive"]
+# Gate-11 CC3: split REQUIRED vs OPTIONAL to match install-mirror.sh's
+# BB1 contract. serena is high-value but installed separately via pipx
+# (not bootstrapped by `make all`), so treat its absence as skipped,
+# not failed. Missing REQUIRED servers remain a hard fail.
+REQUIRED_MCP_SERVERS = ["neuro-link-http", "neuro-link-recursive"]
+OPTIONAL_MCP_SERVERS = ["serena"]
 # Gate-3 M3 fix: must match settings.template.json hook references. The
 # prior list omitted neuro-task-check.sh which settings.template invokes
 # on PreToolUse — completeness gate passed even if that file was missing.
@@ -128,10 +133,14 @@ def check_mcp_servers() -> dict[str, Any]:
     except Exception as e:
         return _fail("mcp-servers", f"invalid JSON: {e}")
     servers = data.get("mcpServers", {}) or {}
-    missing = [s for s in REQUIRED_MCP_SERVERS if s not in servers]
-    if missing:
-        return _fail("mcp-servers", f"missing: {','.join(missing)}")
-    return _pass("mcp-servers", f"registered: {','.join(sorted(servers.keys()))}")
+    missing_required = [s for s in REQUIRED_MCP_SERVERS if s not in servers]
+    missing_optional = [s for s in OPTIONAL_MCP_SERVERS if s not in servers]
+    if missing_required:
+        return _fail("mcp-servers", f"missing required: {','.join(missing_required)}")
+    note = f"required registered: {','.join(sorted(s for s in servers if s in REQUIRED_MCP_SERVERS))}"
+    if missing_optional:
+        note += f"; optional absent: {','.join(missing_optional)}"
+    return _pass("mcp-servers", note)
 
 
 def check_hooks() -> dict[str, Any]:
@@ -314,6 +323,17 @@ def _resolve_serena_bin() -> tuple[Path | None, str]:
 def check_serena_arch() -> dict[str, Any]:
     if "serena-arch" in SKIP:
         return _skipped("serena-arch", "NLR_VERIFY_SKIP")
+    # Gate-11 CC3: serena is optional (see OPTIONAL_MCP_SERVERS above).
+    # If the key isn't in ~/.claude.json at all, skip — there's nothing
+    # to arch-check. Only a REGISTERED-but-broken serena is a hard fail.
+    claude_json = HOME / ".claude.json"
+    if claude_json.is_file():
+        try:
+            cfg = json.loads(claude_json.read_text())
+        except (OSError, json.JSONDecodeError):
+            cfg = {}
+        if "serena" not in (cfg.get("mcpServers") or {}):
+            return _skipped("serena-arch", "serena not registered (optional MCP)")
     serena_bin, why = _resolve_serena_bin()
     if serena_bin is None:
         return _fail("serena-arch", why)

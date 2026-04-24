@@ -28,16 +28,27 @@ services:
     image: neo4j:5.23-community
     ports: ["7474:7474", "7687:7687"]
     environment:
-      # Gate-10 AA1: changed ${VAR:?} to ${VAR:-default} — compose
-      # interpolates all `${VAR:?}` references at config time regardless
-      # of which profile is active, so the strict form aborted
-      # `--profile rag` even though neo4j is behind `profiles: [full]`.
-      # neo4j itself refuses to start with a missing password, so the
-      # safety property is preserved; only the compose-parse failure
-      # was misleading.
-      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-neo4j-password-unset}"
+      # Gate-10 AA1 + Gate-11 CC1: ${VAR:-default} keeps compose parse
+      # unblocked under --profile rag (neo4j is behind profiles:[full]).
+      # The entrypoint below explicitly refuses to start neo4j when the
+      # password is unset or matches the sentinel, so a `--profile full`
+      # launch without secrets hard-fails at container start instead of
+      # booting with a predictable credential.
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-UNSET_PASSWORD_SENTINEL}"
       NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD:-}"
     volumes: ["neo4j-data:/data"]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        if [ -z "$${NEO4J_PASSWORD}" ] || [ "$${NEO4J_PASSWORD}" = "UNSET_PASSWORD_SENTINEL" ]; then
+          echo "FATAL: NEO4J_PASSWORD is unset or sentinel value."
+          echo "       Refusing to start with a predictable credential."
+          echo "       Run 'make secrets-bootstrap' to generate one, then retry."
+          exit 1
+        fi
+        exec /startup/docker-entrypoint.sh neo4j
     healthcheck:
       test: ["CMD-SHELL", "cypher-shell -u neo4j -p $${NEO4J_PASSWORD} 'RETURN 1' || exit 1"]
       interval: 15s

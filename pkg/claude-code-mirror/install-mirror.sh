@@ -209,6 +209,28 @@ HOME="$HOME" envsubst '${HOME}' < "$TEMPLATE" > "$TMP_RENDERED"
 # Strip the top-level _comment key — it exists for template readability only.
 jq 'del(._comment)' "$TMP_RENDERED" > "$TMP_RENDERED.clean" && mv "$TMP_RENDERED.clean" "$TMP_RENDERED"
 
+# Gate-11 CC2: when ~/.local/bin/serena-hooks is absent (optional
+# dependency, same story as serena-mcp per BB1), strip every hook entry
+# that references that binary. Prior behavior injected 4 dangling hook
+# commands on any clean host without serena installed, so every
+# PreToolUse/SessionStart/SessionEnd fired would hit a non-existent
+# file. The filter removes individual hook commands that match
+# `serena-hooks`, then drops any hook block whose nested .hooks array
+# is now empty.
+if [[ ! -x "$HOME/.local/bin/serena-hooks" ]]; then
+  log "  ~/.local/bin/serena-hooks absent — stripping serena-hooks references from template"
+  jq '.hooks |= (
+        with_entries(
+          .value |= (
+            map(.hooks |= map(select(.command | test("serena-hooks") | not)))
+            | map(select((.hooks // []) | length > 0))
+          )
+        )
+        | with_entries(select(.value | length > 0))
+      )' "$TMP_RENDERED" > "$TMP_RENDERED.stripped" \
+    && mv "$TMP_RENDERED.stripped" "$TMP_RENDERED"
+fi
+
 if [[ -f "$SETTINGS" ]]; then
   BACKUP="$SETTINGS.bak.$(date +%s)"
   log "  backing up $SETTINGS → $BACKUP"
