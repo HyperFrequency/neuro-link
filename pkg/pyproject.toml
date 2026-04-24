@@ -26,6 +26,12 @@ dependencies = [
     "dash>=2.18.0",
     # Aggregate-proof + setup-script tooling
     "pyyaml>=6.0",
+    # Python type-check CLI — lsp-grader integration (pkg/scripts/verify.py
+    # confirms pyright responds to --version). Bundles Node via pyright[nodejs].
+    "pyright>=1.1.400",
+    # LSP orchestration library — graders use it to query textDocument/{definition,references,hover}
+    # for callsite verification during harness grading. Microsoft multilspy.
+    "multilspy>=0.0.15",
 ]
 
 [project.optional-dependencies]
