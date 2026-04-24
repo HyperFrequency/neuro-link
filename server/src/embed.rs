@@ -4,6 +4,20 @@ use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
+/// Vault roots scanned by `embed_wiki`, in order.
+///
+/// The new `vaults/` directory is the canonical entry point as of
+/// 2026-04-24 (per `vaults/README.md`). `02-KB-main/` remains in the list
+/// for backward compatibility — existing tests and deployments that never
+/// populated `vaults/` still work. Each root is walked independently; a
+/// missing directory is a silent no-op, not an error.
+///
+/// Path semantics: when a file is found under root `R`, the payload
+/// `path` field is `file.strip_prefix(R)`. So `vaults/papers/a.md`
+/// becomes `papers/a.md`, and `02-KB-main/b.md` becomes `b.md`.
+/// This disambiguates the source of each indexed entry.
+pub const DEFAULT_VAULT_DIRS: &[&str] = &["vaults", "02-KB-main"];
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     pub path: String,
@@ -170,74 +184,89 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
 
     preflight_qdrant_collection(&client, qdrant_url, collection, embedding_dims).await?;
 
-    let kb = root.join("02-KB-main");
     let skip = ["schema.md", "index.md", "log.md"];
     let mut count = 0;
 
-    for entry in WalkDir::new(&kb).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "md")
-            || skip.iter().any(|s| path.file_name().is_some_and(|f| f == *s))
-        {
+    // Walk each vault root in DEFAULT_VAULT_DIRS. A missing directory is a
+    // silent no-op so we can ship the new `vaults/` convention without
+    // breaking existing deployments that only have `02-KB-main/`. The
+    // reverse is also true — a repo that has already moved everything to
+    // `vaults/` doesn't need a placeholder `02-KB-main/`.
+    for vault_name in DEFAULT_VAULT_DIRS {
+        let vault_root = root.join(vault_name);
+        if !vault_root.is_dir() {
             continue;
         }
-        let content = fs::read_to_string(path).unwrap_or_default();
-        let rel = path.strip_prefix(&kb).unwrap_or(path).display().to_string();
 
-        let embed_resp = client
-            .post(&embedding_url)
-            .json(&serde_json::json!({
-                "model": embedding_model,
-                "input": &content[..content.len().min(8000)]
-            }))
-            .send()
-            .await;
-
-        let vector = match embed_resp {
-            Ok(resp) => {
-                let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                body["data"][0]["embedding"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_f64()).collect::<Vec<_>>())
-                    .unwrap_or_default()
+        for entry in WalkDir::new(&vault_root).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e == "md")
+                || skip.iter().any(|s| path.file_name().is_some_and(|f| f == *s))
+            {
+                continue;
             }
-            Err(_) => continue,
-        };
+            let content = fs::read_to_string(path).unwrap_or_default();
+            let rel = path
+                .strip_prefix(&vault_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
 
-        if vector.is_empty() {
-            continue;
-        }
+            let embed_resp = client
+                .post(&embedding_url)
+                .json(&serde_json::json!({
+                    "model": embedding_model,
+                    "input": &content[..content.len().min(8000)]
+                }))
+                .send()
+                .await;
 
-        // Only count upserts that Qdrant actually accepted; previously the
-        // counter was bumped on any send() resolution, making silent
-        // rejects invisible in the success log.
-        let point_id = uuid::Uuid::new_v4().to_string();
-        let upsert_url = format!("{qdrant_url}/collections/{collection}/points");
-        match client
-            .put(&upsert_url)
-            .json(&serde_json::json!({
-                "points": [{
-                    "id": point_id,
-                    "vector": vector,
-                    "payload": { "path": rel, "preview": &content[..content.len().min(500)] }
-                }]
-            }))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    count += 1;
-                } else {
-                    let body = resp.text().await.unwrap_or_default();
-                    tracing::warn!(
-                        "Qdrant upsert for {rel} failed: HTTP {status} from {upsert_url}: {body}"
-                    );
+            let vector = match embed_resp {
+                Ok(resp) => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    body["data"][0]["embedding"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_f64()).collect::<Vec<_>>())
+                        .unwrap_or_default()
                 }
+                Err(_) => continue,
+            };
+
+            if vector.is_empty() {
+                continue;
             }
-            Err(err) => {
-                tracing::warn!("Qdrant upsert for {rel} errored: {err}");
+
+            // Only count upserts that Qdrant actually accepted; previously
+            // the counter was bumped on any send() resolution, making
+            // silent rejects invisible in the success log.
+            let point_id = uuid::Uuid::new_v4().to_string();
+            let upsert_url = format!("{qdrant_url}/collections/{collection}/points");
+            match client
+                .put(&upsert_url)
+                .json(&serde_json::json!({
+                    "points": [{
+                        "id": point_id,
+                        "vector": vector,
+                        "payload": { "path": rel, "preview": &content[..content.len().min(500)] }
+                    }]
+                }))
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        count += 1;
+                    } else {
+                        let body = resp.text().await.unwrap_or_default();
+                        tracing::warn!(
+                            "Qdrant upsert for {rel} failed: HTTP {status} from {upsert_url}: {body}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("Qdrant upsert for {rel} errored: {err}");
+                }
             }
         }
     }
