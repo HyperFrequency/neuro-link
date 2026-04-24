@@ -36,6 +36,9 @@ SKIP = set(filter(None, os.environ.get("NLR_VERIFY_SKIP", "").split(",")))
 OFFLINE = os.environ.get("NLR_VERIFY_OFFLINE") == "1"
 
 REQUIRED_MCP_SERVERS = ["serena", "neuro-link-http", "neuro-link-recursive"]
+# Gate-3 M3 fix: must match settings.template.json hook references. The
+# prior list omitted neuro-task-check.sh which settings.template invokes
+# on PreToolUse — completeness gate passed even if that file was missing.
 REQUIRED_HOOKS = [
     "auto-rag-inject.sh",
     "doc-sync-on-push.sh",
@@ -46,6 +49,7 @@ REQUIRED_HOOKS = [
     "inception-clear-relay.sh",
     "neuro-grade.sh",
     "neuro-log-tool-use.sh",
+    "neuro-task-check.sh",
 ]
 WARM_LLAMA_PORTS = [8400, 8401, 8402]
 
