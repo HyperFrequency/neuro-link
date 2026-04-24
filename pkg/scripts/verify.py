@@ -278,12 +278,43 @@ def _detect_host_arch() -> str:
     return "unknown"
 
 
+def _resolve_serena_bin() -> tuple[Path | None, str]:
+    """Read mcpServers.serena.command from ~/.claude.json and return the
+    resolved binary path. Returns (None, reason) on any failure."""
+    claude_json = HOME / ".claude.json"
+    if not claude_json.is_file():
+        return None, f"{claude_json} missing — install_mcp_servers.sh did not run"
+    try:
+        cfg = json.loads(claude_json.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"could not read {claude_json}: {e}"
+    serena = (cfg.get("mcpServers") or {}).get("serena")
+    if not isinstance(serena, dict):
+        return None, "mcpServers.serena absent or not an object in ~/.claude.json"
+    cmd = serena.get("command")
+    if not isinstance(cmd, str) or not cmd:
+        return None, f"mcpServers.serena.command absent or empty: {serena!r}"
+    expanded = cmd.replace("${HOME}", str(HOME)).replace("$HOME", str(HOME))
+    if expanded.startswith("~"):
+        expanded = str(HOME) + expanded[1:]
+    if expanded.startswith("/"):
+        path = Path(expanded)
+    else:
+        which = shutil.which(expanded)
+        if not which:
+            return None, f"mcpServers.serena.command {expanded!r} not on PATH"
+        path = Path(which)
+    if not path.is_file():
+        return None, f"serena binary {path} (from ~/.claude.json) missing"
+    return path, str(path)
+
+
 def check_serena_arch() -> dict[str, Any]:
     if "serena-arch" in SKIP:
         return _skipped("serena-arch", "NLR_VERIFY_SKIP")
-    serena_bin = HOME / ".local" / "bin" / "serena-hooks"
-    if not serena_bin.is_file():
-        return _fail("serena-arch", f"{serena_bin} missing")
+    serena_bin, why = _resolve_serena_bin()
+    if serena_bin is None:
+        return _fail("serena-arch", why)
 
     # ~/.local/bin/serena-hooks is usually a pip wrapper script — running
     # file(1) directly tells you "ASCII text". Resolve symlinks, then

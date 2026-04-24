@@ -125,9 +125,14 @@ if [[ -f "$SETTINGS" ]]; then
             (($eh[$e] // []) + ($th[$e] // []))
             | group_by(.matcher)
             | map(
-                { matcher: (.[0].matcher),
-                  hooks: (map(.hooks // []) | add | unique_by(.command)) }
-                | if .matcher == null then del(.matcher) else . end
+                # Preserve the FULL first object in the group: it is
+                # always the existing user block when one exists (the
+                # concat above puts existing before template), so any
+                # per-block fields the user added (timeout, active
+                # flags, etc.) survive instead of being stripped down
+                # to a bare {matcher, hooks}.
+                .[0]
+                + { hooks: (map(.hooks // []) | add | unique_by(.command)) }
               )
           )
         )
@@ -174,22 +179,47 @@ _expand_cmd() {
 }
 
 is_mcp_entry_valid() {
+  # Validate by transport type. stdio entries must have an executable
+  # .command; http/sse entries must have a well-formed .url. The earlier
+  # version applied the stdio check to all transports, which incorrectly
+  # rejected neuro-link-http (a legitimate {type:"http",url:...} entry
+  # with no .command field).
   local srv="$1"
-  jq -e --arg s "$srv" '
-    .mcpServers[$s] as $e
-    | if ($e | type) != "object" then false
-      elif ($e.command | type) != "string" then false
-      elif ($e.command | length) == 0 then false
-      else true end
-    ' "$CLAUDE_JSON" >/dev/null 2>&1 || return 1
-  local cmd
-  cmd=$(jq -r --arg s "$srv" '.mcpServers[$s].command' "$CLAUDE_JSON")
-  cmd="$(_expand_cmd "$cmd")"
-  if [[ "$cmd" == /* ]]; then
-    [[ -x "$cmd" ]]
-  else
-    command -v "$cmd" >/dev/null 2>&1
-  fi
+  local entry_type
+  entry_type=$(jq -r --arg s "$srv" \
+    '.mcpServers[$s].type // (if (.mcpServers[$s].url | type) == "string" then "http" else "stdio" end) // "stdio"' \
+    "$CLAUDE_JSON" 2>/dev/null)
+  case "$entry_type" in
+    stdio)
+      jq -e --arg s "$srv" '
+        .mcpServers[$s] as $e
+        | if ($e | type) != "object" then false
+          elif ($e.command | type) != "string" then false
+          elif ($e.command | length) == 0 then false
+          else true end
+        ' "$CLAUDE_JSON" >/dev/null 2>&1 || return 1
+      local cmd
+      cmd=$(jq -r --arg s "$srv" '.mcpServers[$s].command' "$CLAUDE_JSON")
+      cmd="$(_expand_cmd "$cmd")"
+      if [[ "$cmd" == /* ]]; then
+        [[ -x "$cmd" ]]
+      else
+        command -v "$cmd" >/dev/null 2>&1
+      fi
+      ;;
+    http|sse)
+      jq -e --arg s "$srv" '
+        .mcpServers[$s] as $e
+        | if ($e | type) != "object" then false
+          elif ($e.url | type) != "string" then false
+          elif ($e.url | test("^https?://")) then true
+          else false end
+        ' "$CLAUDE_JSON" >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 collect_missing_mcp() {
