@@ -68,9 +68,12 @@ services:
   # qdrant collection (4096-dim) is built from THIS embedder.
   llama-embed:
     image: ghcr.io/ggml-org/llama.cpp:server
+    # OCTEN_VARIANT must match the variant downloaded by
+    # .claude/skills/neuro-link-setup/scripts/download_models.sh.
+    # Default f16 = ~15 GB, matches the live :8400 llama-server.
     command: >
       --embeddings
-      --model /models/Octen-Embedding-8B.f16.gguf
+      --model /models/Octen-Embedding-8B.${OCTEN_VARIANT:-f16}.gguf
       --port 8400 --host 0.0.0.0
       --ctx-size 4096 --batch-size 512 --threads 8 --no-warmup
     ports: ["8400:8400"]
