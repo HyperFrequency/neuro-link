@@ -51,7 +51,7 @@ cloud-ray: $(PROOF_DIR)
 	@bash pkg/cloud/ray/deploy.sh $(VERSION) | tee $(PROOF_DIR)/ray.log
 
 models:
-	@bash $(ROOT)/skills/neuro-link-setup/scripts/download_models.sh
+	@bash $(ROOT)/.claude/skills/neuro-link-setup/scripts/download_models.sh
 
 dashboards:
 	@bash pkg/dashboards/bring-up.sh

@@ -1,4 +1,4 @@
-# neuro-link-recursive
+# neuro-link
 
 Unified context, memory & behavior control plane. Hybrid RAG + LLM-Wiki system with auto-curation, reasoning ontologies, and recursive self-improvement. Rust binary (`neuro-link`) + TurboVault SDK + qmd sidecar.
 
