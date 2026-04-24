@@ -63,6 +63,70 @@ services:
       neo4j: { condition: service_healthy }
     profiles: ["ingest"]
 
+  # Warm llama.cpp server for the Octen-8B embedder. Mirrors the host's
+  # PID 57419 pattern (--embeddings mode, 4096-dim vectors). nlr_wiki
+  # qdrant collection (4096-dim) is built from THIS embedder.
+  llama-embed:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: >
+      --embeddings
+      --model /models/Octen-Embedding-8B.f16.gguf
+      --port 8400 --host 0.0.0.0
+      --ctx-size 4096 --batch-size 512 --threads 8 --no-warmup
+    ports: ["8400:8400"]
+    volumes:
+      # Bind-mount host models dir; named volume doesn't cover the 15 GB GGUF.
+      - ${NLR_MODELS_DIR:-~/neuro-link-models}:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8400/health | grep -q 200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    profiles: ["rag", "full"]
+
+  # Warm llama.cpp server for the Qwen3-Reranker cross-encoder.
+  # qmd 0.1.2 does NOT call it out of the box — this is the target for the
+  # server-side rerank path (R+2 P5 rag.rs: hit :8401 after qmd's initial top-K).
+  llama-rerank:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: >
+      --reranking
+      --model /models/qwen3-reranker-0.6b-q8_0.gguf
+      --port 8401 --host 0.0.0.0
+      --ctx-size 2048 --threads 4 --no-warmup
+    ports: ["8401:8401"]
+    volumes:
+      - ${QMD_CACHE_DIR:-~/.cache/qmd/models}:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8401/health | grep -q 200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    profiles: ["rag", "full"]
+
+  # Warm llama.cpp server for the qmd query-expansion 1.7B model.
+  # Serves as a text-completion endpoint — neuro-link's retrieval path calls
+  # this once per query to get 3-5 paraphrased sub-queries, then runs them
+  # in parallel against qdrant.
+  llama-qexpand:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: >
+      --model /models/qmd-query-expansion-1.7B-q4_k_m.gguf
+      --port 8402 --host 0.0.0.0
+      --ctx-size 2048 --threads 4 --no-warmup
+    ports: ["8402:8402"]
+    volumes:
+      - ${QMD_CACHE_DIR:-~/.cache/qmd/models}:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8402/health | grep -q 200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    profiles: ["rag", "full"]
+
   optuna-dashboard:
     image: python:3.12-slim
     command: >

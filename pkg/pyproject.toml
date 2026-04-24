@@ -2,15 +2,22 @@
 name = "neuro-link-pkg-tooling"
 version = "0.2.0"
 description = "Python tooling that ships with neuro-link installers (model download, dashboards, first-run bootstrap)"
-requires-python = ">=3.11"
+# 3.12+ required because qmd transitively pulls torch, and on Apple Silicon
+# the uv-managed cpython-3.11 is x86_64 (see pkg/README.md §arm64-python-trap).
+# x86_64 interpreter → torch 2.2.2 (last x86_64 macOS build) → numpy conflict
+# → qmd import crash. 3.12 has native arm64 wheels at uv.
+requires-python = ">=3.12"
 dependencies = [
     # Model fetching (first-run bootstrap)
     "huggingface-hub>=0.28.0",
     # RAG retrieval sidecar — BM25 + vector + rerank + query-expand
-    # Uses the three GGUF models downloaded by scripts/download_models.sh
-    # (Octen-Embedding-8B, Qwen3-Reranker-0.6B, qmd-query-expansion-1.7B).
-    # Neuro-link Rust server calls `qmd search` as a subprocess per
-    # docs/qmd-pipeline.md.
+    # Uses the three GGUF models downloaded by scripts/download_models.sh.
+    # Neuro-link Rust server will call `qmd search` as a subprocess per
+    # deep-tool-wiki/qmd/code.md §2 (server/src/rag.rs — WIP in R+2 P5).
+    #
+    # NOTE: qmd 0.1.2's default embedder is Qwen3-Embedding-0.6B (1024-dim).
+    # neuro-link's nlr_wiki qdrant collection is Octen-8B 4096-dim. Before
+    # wiring qmd to nlr_wiki, resolve the dim mismatch (R+2 P4).
     "qmd>=0.1.2",
     # Dashboards referenced in pkg/README.md
     "optuna>=4.0.0",
@@ -19,7 +26,6 @@ dependencies = [
     "dash>=2.18.0",
     # Aggregate-proof + setup-script tooling
     "pyyaml>=6.0",
-    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

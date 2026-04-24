@@ -10,6 +10,7 @@ mod graph;
 mod heartbeat;
 mod init;
 mod protocol;
+mod rag;
 mod resort;
 mod security;
 mod sessions;
