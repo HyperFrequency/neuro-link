@@ -380,9 +380,15 @@ def _resolve_serena_bin() -> tuple[Path | None, str]:
 def check_serena_arch() -> dict[str, Any]:
     if "serena-arch" in SKIP:
         return _skipped("serena-arch", "NLR_VERIFY_SKIP")
-    # Gate-11 CC3: serena is optional (see OPTIONAL_MCP_SERVERS above).
-    # If the key isn't in ~/.claude.json at all, skip — there's nothing
-    # to arch-check. Only a REGISTERED-but-broken serena is a hard fail.
+    # Gate-11 CC3 + Gate-13 FF1: serena is an OPTIONAL MCP — matching
+    # install-mirror.sh BB1's contract. If the key isn't registered,
+    # skip. If the key IS registered but the binary can't be resolved
+    # (stale entry from a prior uninstall, wrong path, etc.), ALSO skip
+    # with a warn note — install-mirror.sh treats that case as "warn
+    # only" for optional servers, so the gate must match or retries on
+    # non-pristine hosts go red even when the installer said OK.
+    # Returning _skipped (not _fail) keeps the optional contract intact
+    # while surfacing the stale entry in the gate note.
     claude_json = HOME / ".claude.json"
     if claude_json.is_file():
         try:
@@ -393,7 +399,7 @@ def check_serena_arch() -> dict[str, Any]:
             return _skipped("serena-arch", "serena not registered (optional MCP)")
     serena_bin, why = _resolve_serena_bin()
     if serena_bin is None:
-        return _fail("serena-arch", why)
+        return _skipped("serena-arch", f"optional serena unresolvable: {why}")
 
     # ~/.local/bin/serena-hooks is usually a pip wrapper script — running
     # file(1) directly tells you "ASCII text". Resolve symlinks, then
