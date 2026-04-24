@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""pkg/scripts/verify.py — install-completeness gate.
+
+Runs per-component checks against a fresh install and emits
+`pkg/.proof/INSTALL_COMPLETE.ready.json` with pass/fail per component
+plus a top-level `green` boolean. Exit 0 iff every required check passes
+(or is deliberately skipped via env).
+
+Skipping rules:
+  - NLR_VERIFY_SKIP=comp1,comp2  — skip listed checks (mark as 'skipped', not fail)
+  - NLR_VERIFY_NEO4J_PASS        — required for the Neo4j HTTP check
+  - NLR_VERIFY_OFFLINE=1         — skip llama-server + Neo4j + Qdrant probes
+
+The gate is intentionally strict: a check's "failure" here means the
+install did NOT reach parity with the user's existing box. That's the
+whole point of A8.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PROOF_DIR = REPO_ROOT / "pkg" / ".proof"
+HOME = Path(os.environ["HOME"])
+
+SKIP = set(filter(None, os.environ.get("NLR_VERIFY_SKIP", "").split(",")))
+OFFLINE = os.environ.get("NLR_VERIFY_OFFLINE") == "1"
+
+REQUIRED_MCP_SERVERS = ["serena", "neuro-link-http", "neuro-link-recursive"]
+REQUIRED_HOOKS = [
+    "auto-rag-inject.sh",
+    "doc-sync-on-push.sh",
+    "harness-bridge-check.sh",
+    "hf-docs-trigger.sh",
+    "hf-fork-auto-ingest.sh",
+    "hf-fork-trigger.sh",
+    "inception-clear-relay.sh",
+    "neuro-grade.sh",
+    "neuro-log-tool-use.sh",
+]
+WARM_LLAMA_PORTS = [8400, 8401, 8402]
+
+
+def _run(cmd: list[str], timeout: float = 10.0) -> tuple[int, str]:
+    """Run cmd, return (rc, combined-stdout+stderr). Never raises."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except FileNotFoundError:
+        return 127, f"not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, f"timeout after {timeout}s"
+    except Exception as e:  # pragma: no cover
+        return 1, str(e)
+
+
+def _http_ok(url: str, timeout: float = 3.0) -> tuple[bool, str]:
+    """GET url; return (ok, note)."""
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 400, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _skipped(name: str, reason: str) -> dict[str, Any]:
+    return {"name": name, "status": "skipped", "reason": reason}
+
+
+def _pass(name: str, note: str = "") -> dict[str, Any]:
+    return {"name": name, "status": "pass", "note": note}
+
+
+def _fail(name: str, reason: str) -> dict[str, Any]:
+    return {"name": name, "status": "fail", "reason": reason}
+
+
+# --- Checks --------------------------------------------------------------
+
+
+def check_pyright() -> dict[str, Any]:
+    if "pyright" in SKIP:
+        return _skipped("pyright", "NLR_VERIFY_SKIP")
+    if shutil.which("pyright") is None:
+        return _fail("pyright", "not on PATH (pip install pyright in the pkg venv)")
+    rc, out = _run(["pyright", "--version"])
+    if rc == 0:
+        return _pass("pyright", out.strip().splitlines()[0] if out else "")
+    return _fail("pyright", f"--version exit {rc}: {out[:200]}")
+
+
+def check_multilspy() -> dict[str, Any]:
+    if "multilspy" in SKIP:
+        return _skipped("multilspy", "NLR_VERIFY_SKIP")
+    # multilspy is a library, not a CLI; import-check it from the harness venv
+    # by invoking python -c "import multilspy".
+    python = shutil.which("python3") or shutil.which("python")
+    if python is None:
+        return _fail("multilspy", "no python3 on PATH")
+    rc, out = _run([python, "-c", "import multilspy; print(multilspy.__name__)"])
+    if rc == 0 and "multilspy" in out:
+        return _pass("multilspy", "importable from harness venv")
+    return _fail("multilspy", f"import failed exit {rc}: {out[:200]}")
+
+
+def check_mcp_servers() -> dict[str, Any]:
+    if "mcp-servers" in SKIP:
+        return _skipped("mcp-servers", "NLR_VERIFY_SKIP")
+    claude_json = HOME / ".claude.json"
+    if not claude_json.is_file():
+        return _fail("mcp-servers", f"{claude_json} does not exist")
+    try:
+        data = json.loads(claude_json.read_text())
+    except Exception as e:
+        return _fail("mcp-servers", f"invalid JSON: {e}")
+    servers = data.get("mcpServers", {}) or {}
+    missing = [s for s in REQUIRED_MCP_SERVERS if s not in servers]
+    if missing:
+        return _fail("mcp-servers", f"missing: {','.join(missing)}")
+    return _pass("mcp-servers", f"registered: {','.join(sorted(servers.keys()))}")
+
+
+def check_hooks() -> dict[str, Any]:
+    if "hooks" in SKIP:
+        return _skipped("hooks", "NLR_VERIFY_SKIP")
+    hooks_dir = HOME / ".claude" / "hooks"
+    if not hooks_dir.is_dir():
+        return _fail("hooks", f"{hooks_dir} missing")
+    present = {p.name for p in hooks_dir.iterdir() if p.suffix == ".sh"}
+    missing = [h for h in REQUIRED_HOOKS if h not in present]
+    if missing:
+        return _fail("hooks", f"{len(missing)} hook(s) missing: {','.join(missing)}")
+    return _pass("hooks", f"{len(REQUIRED_HOOKS)}/{len(REQUIRED_HOOKS)} hooks present")
+
+
+def check_qmd() -> dict[str, Any]:
+    if "qmd" in SKIP:
+        return _skipped("qmd", "NLR_VERIFY_SKIP")
+    if shutil.which("qmd") is None:
+        return _fail("qmd", "not on PATH (pip install qmd)")
+    rc, out = _run(["qmd", "collection", "list"], timeout=15)
+    if rc == 0:
+        return _pass("qmd", (out.strip().splitlines() or ["(no output)"])[0][:120])
+    return _fail("qmd", f"collection list exit {rc}: {out[:200]}")
+
+
+def check_llama_servers() -> dict[str, Any]:
+    if "llama-servers" in SKIP or OFFLINE:
+        return _skipped("llama-servers", "NLR_VERIFY_OFFLINE or SKIP")
+    reachable = []
+    down = []
+    for port in WARM_LLAMA_PORTS:
+        ok, _ = _http_ok(f"http://127.0.0.1:{port}/v1/models", timeout=2.0)
+        (reachable if ok else down).append(port)
+    if not reachable:
+        # Non-fatal but loud — user may have them intentionally stopped.
+        return {
+            "name": "llama-servers",
+            "status": "warn",
+            "reason": f"no warm llama-servers reachable on {WARM_LLAMA_PORTS}; expected at least 1",
+            "reachable": reachable,
+            "down": down,
+        }
+    return {
+        "name": "llama-servers",
+        "status": "pass",
+        "note": f"{len(reachable)}/{len(WARM_LLAMA_PORTS)} reachable",
+        "reachable": reachable,
+        "down": down,
+    }
+
+
+def check_neo4j() -> dict[str, Any]:
+    if "neo4j" in SKIP or OFFLINE:
+        return _skipped("neo4j", "NLR_VERIFY_OFFLINE or SKIP")
+    ok, note = _http_ok("http://127.0.0.1:7474/", timeout=3.0)
+    if not ok:
+        return _fail("neo4j", f"7474 probe: {note}")
+    # Optional: count tools if password provided.
+    pw = os.environ.get("NLR_VERIFY_NEO4J_PASS")
+    if not pw:
+        return _pass("neo4j", f"HTTP port up (no NLR_VERIFY_NEO4J_PASS for content check)")
+    user = os.environ.get("NEO4J_USER", "neo4j")
+    import base64
+
+    auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:7474/db/neo4j/tx/commit",
+        data=json.dumps({"statements": [{"statement": "MATCH (t:Tool) RETURN count(t) AS n"}]}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Basic {auth}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read())
+        n = body.get("results", [{}])[0].get("data", [{}])[0].get("row", [0])[0]
+        if n >= 1:
+            return _pass("neo4j", f"{n} Tool node(s) present")
+        return _fail("neo4j", "0 Tool nodes — run scripts/ingest_deep_tool_wiki_into_neo4j.sh")
+    except Exception as e:
+        return _fail("neo4j", f"query failed: {e}")
+
+
+def check_qdrant() -> dict[str, Any]:
+    if "qdrant" in SKIP or OFFLINE:
+        return _skipped("qdrant", "NLR_VERIFY_OFFLINE or SKIP")
+    ok, note = _http_ok("http://127.0.0.1:6333/collections/nlr_wiki", timeout=3.0)
+    if not ok:
+        return _fail("qdrant", f"collection probe: {note}")
+    # Fetch point count
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:6333/collections/nlr_wiki",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = json.loads(resp.read())
+        count = body.get("result", {}).get("points_count", 0)
+        status = body.get("result", {}).get("status", "unknown")
+        if count >= 25 and status == "green":
+            return _pass("qdrant", f"nlr_wiki: {count} points, status={status}")
+        return _fail(
+            "qdrant",
+            f"nlr_wiki has {count} points (need >=25), status={status}",
+        )
+    except Exception as e:
+        return _fail("qdrant", f"query failed: {e}")
+
+
+def check_vaults_dir() -> dict[str, Any]:
+    if "vaults" in SKIP:
+        return _skipped("vaults", "NLR_VERIFY_SKIP")
+    vaults_dir = REPO_ROOT / "vaults"
+    if not vaults_dir.is_dir():
+        return _fail("vaults", f"{vaults_dir} does not exist — A5 not applied?")
+    readme = vaults_dir / "README.md"
+    if not readme.is_file():
+        return _fail("vaults", f"{readme} missing")
+    return _pass("vaults", f"{vaults_dir} + README.md present")
+
+
+def check_serena_arch() -> dict[str, Any]:
+    if "serena-arch" in SKIP:
+        return _skipped("serena-arch", "NLR_VERIFY_SKIP")
+    serena_bin = HOME / ".local" / "bin" / "serena-hooks"
+    if not serena_bin.is_file():
+        return _fail("serena-arch", f"{serena_bin} missing")
+    # Use `file` command to detect Mach-O architecture on macOS
+    rc, out = _run(["file", str(serena_bin)])
+    if rc != 0:
+        return _fail("serena-arch", f"file(1) exit {rc}: {out[:200]}")
+    if "arm64" in out:
+        return _pass("serena-arch", "arm64 binary (Apple Silicon native)")
+    if "x86_64" in out and "arm64" not in out:
+        return _fail("serena-arch", f"x86_64 only (Rosetta) — reinstall for arm64: {out[:200]}")
+    # Shell script / universal binary / something else — best-effort pass.
+    return {"name": "serena-arch", "status": "warn", "note": f"unknown arch signature: {out[:120]}"}
+
+
+# --- Main ----------------------------------------------------------------
+
+
+CHECKS = [
+    check_pyright,
+    check_multilspy,
+    check_mcp_servers,
+    check_hooks,
+    check_qmd,
+    check_llama_servers,
+    check_neo4j,
+    check_qdrant,
+    check_vaults_dir,
+    check_serena_arch,
+]
+
+
+def main() -> int:
+    results = []
+    for fn in CHECKS:
+        try:
+            results.append(fn())
+        except Exception as e:  # pragma: no cover
+            results.append(_fail(fn.__name__, f"unexpected exception: {e}"))
+
+    # green: zero fails (warns and skips are allowed).
+    statuses = [r["status"] for r in results]
+    fails = sum(1 for s in statuses if s == "fail")
+    warns = sum(1 for s in statuses if s == "warn")
+    skips = sum(1 for s in statuses if s == "skipped")
+    passes = sum(1 for s in statuses if s == "pass")
+    green = fails == 0
+
+    PROOF_DIR.mkdir(parents=True, exist_ok=True)
+    out = {
+        "target": "INSTALL_COMPLETE",
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "run_id": os.environ.get("NLR_RUN_ID", "unknown-run"),
+        "green": green,
+        "summary": {"pass": passes, "fail": fails, "warn": warns, "skipped": skips},
+        "checks": results,
+    }
+    proof_path = PROOF_DIR / "INSTALL_COMPLETE.ready.json"
+    proof_path.write_text(json.dumps(out, indent=2) + "\n")
+
+    # Human-readable summary to stderr
+    print(f"INSTALL_COMPLETE: green={green} | pass={passes} fail={fails} warn={warns} skipped={skips}", file=sys.stderr)
+    for r in results:
+        line = f"  [{r['status']:<7}] {r['name']}"
+        if r.get("note"):
+            line += f" — {r['note']}"
+        if r.get("reason"):
+            line += f" — {r['reason']}"
+        print(line, file=sys.stderr)
+    print(f"Proof: {proof_path}", file=sys.stderr)
+
+    return 0 if green else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
