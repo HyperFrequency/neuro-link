@@ -1,0 +1,114 @@
+{
+  "_comment": "Template for ~/.claude/settings.json. Paths use ${HOME} placeholders; install-mirror.sh substitutes at install time via envsubst. Merged with any existing settings.json via jq — your existing permissions/enabledPlugins are preserved.",
+  "permissions": {
+    "allow": [
+      "Read(//${HOME}/.claude/skills/**)",
+      "Read(//${HOME}/.claude/**)"
+    ],
+    "defaultMode": "auto"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/hf-docs-trigger.sh"
+          },
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/auto-rag-inject.sh"
+          },
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/neuro-task-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/inception-clear-relay.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/hf-fork-trigger.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/harness-bridge-check.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.local/bin/serena-hooks auto-approve --client claude-code"
+          },
+          {
+            "type": "command",
+            "command": "${HOME}/.local/bin/serena-hooks remind --client claude-code"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.local/bin/serena-hooks activate --client claude-code"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.local/bin/serena-hooks cleanup --client claude-code"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/hf-fork-auto-ingest.sh"
+          },
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/doc-sync-on-push.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/neuro-log-tool-use.sh"
+          },
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/neuro-grade.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "effortLevel": "xhigh",
+  "agentPushNotifEnabled": true
+}

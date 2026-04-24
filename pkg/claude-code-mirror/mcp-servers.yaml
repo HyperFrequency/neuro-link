@@ -1,0 +1,71 @@
+# Declarative MCP server registration for neuro-link installs.
+#
+# install-mirror.sh reads this file and feeds each entry to
+# `.claude/skills/neuro-link-setup/scripts/install_mcp_servers.sh`
+# (or an equivalent jq merge into ~/.claude.json).
+#
+# Only the three core neuro-link servers are mandatory. context7/auggie are
+# optional — they register only if the corresponding CLI/MCP binary is on
+# PATH at install time.
+
+required:
+  - name: neuro-link-recursive
+    type: stdio
+    command: "${NLR_BIN:-${NLR_ROOT}/server/target/release/neuro-link}"
+    args: ["mcp"]
+    env:
+      NLR_ROOT: "${NLR_ROOT}"
+    notes: |
+      Canonical internal write path for 02-KB-main/ via nlr_wiki_* tools.
+      Also exposes nlr_harness_*, nlr_rag_*, nlr_ontology_*, nlr_sessions_*,
+      nlr_tasks_*, nlr_scan_*.
+
+  - name: neuro-link-http
+    type: http
+    url: "http://127.0.0.1:8787/mcp"
+    headers:
+      Authorization: "Bearer ${NLR_API_TOKEN}"
+    notes: |
+      HTTP-transport twin of neuro-link-recursive. Same tool surface; used
+      by ngrok/Caddy for public exposure and by non-Claude-Code harnesses.
+      NLR_API_TOKEN must be set in secrets/.env.
+
+  - name: serena
+    type: stdio
+    command: "${HOME}/.local/bin/serena-mcp"
+    args: []
+    notes: |
+      Symbolic coding tools (find_symbol, get_symbols_overview, etc.).
+      Install via `pipx install serena-mcp` or the serena installer; binary
+      must be the arm64 build on Apple Silicon (not the x86 Rosetta build).
+
+optional:
+  - name: turbovault
+    type: http
+    url: "http://127.0.0.1:3001/mcp"
+    headers:
+      Authorization: "Bearer ${NLR_API_TOKEN}"
+    notes: |
+      Public-facing TurboVault surface (47 tools). Registered only if
+      turbovault binary is installed. HTTP port is proxied through Caddy
+      for ngrok exposure.
+
+  - name: context7
+    type: http
+    url: "https://mcp.context7.com/mcp"
+    headers:
+      Authorization: "Bearer ${CONTEXT7_API_KEY}"
+    notes: |
+      Upstash-hosted library docs. Registered only if CONTEXT7_API_KEY is
+      set; unauthenticated access is rate-limited and not recommended for
+      /docs-dual-lookup workflows.
+
+  - name: infranodus
+    type: http
+    url: "https://mcp.infranodus.com/"
+    headers:
+      accept: "application/json, text/event-stream"
+      Authorization: "Bearer ${INFRANODUS_API_KEY}"
+    notes: |
+      Text-network analysis. Registered via mcporter if INFRANODUS_API_KEY
+      is set AND `mcporter` is on PATH (npm install -g mcporter).
