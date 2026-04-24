@@ -147,23 +147,12 @@ else
   run cp "$TMP_RENDERED" "$SETTINGS"
 fi
 
-# --- 4. Register MCP servers ---
-log "Registering MCP servers via install_mcp_servers.sh"
-MCP_INSTALLER="$REPO_ROOT/.claude/skills/neuro-link-setup/scripts/install_mcp_servers.sh"
-if [[ -x "$MCP_INSTALLER" ]]; then
-  run bash "$MCP_INSTALLER"
-else
-  log "  WARNING: $MCP_INSTALLER not found or not executable; skipping MCP registration."
-fi
-
-# --- 5. Post-install MCP validation ---
-# Validate every REQUIRED MCP entry in ~/.claude.json is structurally
-# sound (object with non-empty .command string) AND operationally viable
-# (the resolved command is executable). Key-presence alone is not
-# enough: a stale entry left behind by an earlier install will pass
-# presence but fail at runtime, leaving the gate green and the stack
-# broken. Malformed/missing serena gets normalized to the canonical
-# shape from mcp-servers.yaml (~/.local/bin/serena-mcp, stdio, no args).
+# --- MCP validation helpers (used in sections 4 + 6) ---
+# Defined here, before the MCP_INSTALLER call, so the pre-mutation guard
+# can run BEFORE install_mcp_servers.sh — the installer's `jq -s '.[0] *
+# .[1]'` merge is destructive (overwrites existing required MCP entries
+# wholesale), so we must classify and bail out without ever invoking it
+# when the user has a present-but-invalid entry that must not be lost.
 CLAUDE_JSON="${HOME}/.claude.json"
 REQUIRED_MCP=("neuro-link-recursive" "neuro-link-http" "serena")
 
@@ -238,6 +227,45 @@ classify_mcp() {
   fi
 }
 
+# --- 4. Pre-MCP classification (no mutation) ---
+# install_mcp_servers.sh uses `jq -s '.[0] * .[1]'` which OVERWRITES
+# existing required MCP entries wholesale. If the user has an existing
+# but invalid entry for any of REQUIRED_MCP, we must report and exit
+# BEFORE the destructive call so their (possibly-intentional, custom-
+# transport) entry isn't silently clobbered. Only after a clean
+# pre-check does section 5 invoke the installer.
+if [[ "$DRY_RUN" != "1" && -f "$CLAUDE_JSON" ]]; then
+  PREMUT_MALFORMED=()
+  for srv in "${REQUIRED_MCP[@]}"; do
+    [[ "$(classify_mcp "$srv")" == "malformed" ]] && PREMUT_MALFORMED+=("$srv")
+  done
+  if (( ${#PREMUT_MALFORMED[@]} > 0 )); then
+    log "ERROR: required MCP entries present in $CLAUDE_JSON but failed validation:"
+    log "       ${PREMUT_MALFORMED[*]}"
+    log "  install_mcp_servers.sh would overwrite these (its jq merge is destructive),"
+    log "  so we exit BEFORE running it. Fix each entry by hand to preserve any custom"
+    log "  args/env/transport choices, then re-run. Validators:"
+    log "    stdio entries: .command must be a non-empty string resolving to an executable file"
+    log "    http/sse entries: .url must be a string matching ^https?://"
+    exit 3
+  fi
+fi
+
+# --- 5. Register MCP servers ---
+log "Registering MCP servers via install_mcp_servers.sh"
+MCP_INSTALLER="$REPO_ROOT/.claude/skills/neuro-link-setup/scripts/install_mcp_servers.sh"
+if [[ -x "$MCP_INSTALLER" ]]; then
+  run bash "$MCP_INSTALLER"
+else
+  log "  WARNING: $MCP_INSTALLER not found or not executable; skipping MCP registration."
+fi
+
+# --- 6. Post-install MCP validation ---
+# At this point the pre-mutation guard above guaranteed any required
+# entries that EXISTED were valid; install_mcp_servers.sh just added
+# the missing canonical entries. Re-classify to confirm + auto-create
+# canonical serena (the installer doesn't register serena itself), and
+# exit 3 if anything is still missing or somehow malformed post-merge.
 if [[ "$DRY_RUN" == "1" ]]; then
   log "DRY: would validate MCP servers (structural + operational): ${REQUIRED_MCP[*]}"
 elif [[ ! -f "$CLAUDE_JSON" ]]; then

@@ -68,9 +68,13 @@ services:
   # qdrant collection (4096-dim) is built from THIS embedder.
   llama-embed:
     image: ghcr.io/ggml-org/llama.cpp:server
-    # OCTEN_VARIANT must match the variant downloaded by
-    # .claude/skills/neuro-link-setup/scripts/download_models.sh.
-    # Default f16 = ~15 GB, matches the live :8400 llama-server.
+    # OCTEN_VARIANT + NLR_MODELS_DIR are loaded from the manifest written
+    # by download_models.sh — single source of truth. If the manifest is
+    # missing (i.e. `make models` hasn't run), compose fails to parse
+    # this service, surfacing the real prerequisite instead of starting
+    # llama-embed against a non-existent file.
+    env_file:
+      - ${NLR_MODELS_DIR:-~/neuro-link-models}/.octen-manifest.env
     command: >
       --embeddings
       --model /models/Octen-Embedding-8B.${OCTEN_VARIANT:-f16}.gguf
@@ -78,7 +82,8 @@ services:
       --ctx-size 4096 --batch-size 512 --threads 8 --no-warmup
     ports: ["8400:8400"]
     volumes:
-      # Bind-mount host models dir; named volume doesn't cover the 15 GB GGUF.
+      # Bind-mount the EXACT path the manifest declares — see env_file
+      # above. Named volumes don't cover the 15 GB GGUF.
       - ${NLR_MODELS_DIR:-~/neuro-link-models}:/models:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8400/health | grep -q 200"]
