@@ -6,6 +6,12 @@ requires-python = ">=3.11"
 dependencies = [
     # Model fetching (first-run bootstrap)
     "huggingface-hub>=0.28.0",
+    # RAG retrieval sidecar — BM25 + vector + rerank + query-expand
+    # Uses the three GGUF models downloaded by scripts/download_models.sh
+    # (Octen-Embedding-8B, Qwen3-Reranker-0.6B, qmd-query-expansion-1.7B).
+    # Neuro-link Rust server calls `qmd search` as a subprocess per
+    # docs/qmd-pipeline.md.
+    "qmd>=0.1.2",
     # Dashboards referenced in pkg/README.md
     "optuna>=4.0.0",
     "optuna-dashboard>=0.16.0",
