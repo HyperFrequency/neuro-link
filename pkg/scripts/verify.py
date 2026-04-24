@@ -192,6 +192,17 @@ def check_mcp_servers() -> dict[str, Any]:
     if malformed_required:
         return _fail("mcp-servers", f"required registered but invalid: {'; '.join(malformed_required)}")
 
+    # Gate-16 II1: send the entry's configured headers (so a Bearer
+    # token misconfiguration surfaces as 401/403 here) and treat
+    # specific 4xx codes as failure. 2xx/3xx/405 still pass — 405
+    # means a live MCP listener that just doesn't speak GET. Headers
+    # may reference env vars like ${NLR_API_TOKEN} that the host
+    # shell expands; we evaluate those at probe time so an unset
+    # token shows up as a 401/403 from the real endpoint, not a
+    # false-positive pass.
+    def _resolve_header_value(raw: str) -> str:
+        return os.path.expandvars(raw)
+
     unreachable_required: list[str] = []
     if not OFFLINE:
         for srv in REQUIRED_MCP_SERVERS:
@@ -200,21 +211,22 @@ def check_mcp_servers() -> dict[str, Any]:
             if transport not in ("http", "sse"):
                 continue
             url = entry.get("url", "")
-            # Tolerate both /mcp endpoints (which may 405 on GET) and
-            # /health-style endpoints. Accept any HTTP status < 500
-            # as "listener is up"; only timeouts / refused connections
-            # count as unreachable. 2-second cap keeps proof under a
-            # few seconds total even when all listeners are down.
+            headers = {k: _resolve_header_value(v) for k, v in (entry.get("headers") or {}).items() if isinstance(v, str)}
             try:
-                req = urllib.request.Request(url, method="GET")
+                req = urllib.request.Request(url, headers=headers, method="GET")
                 with urllib.request.urlopen(req, timeout=2.0) as resp:
-                    if resp.status >= 500:
-                        unreachable_required.append(f"{srv}(HTTP {resp.status})")
+                    code = resp.status
             except urllib.error.HTTPError as e:
-                if e.code >= 500:
-                    unreachable_required.append(f"{srv}(HTTP {e.code})")
+                code = e.code
             except Exception as e:
                 unreachable_required.append(f"{srv}({type(e).__name__})")
+                continue
+            # 2xx success, 3xx redirect, 405 method-not-allowed (live
+            # MCP that needs POST) → PASS. 401/403 auth, 404 wrong
+            # endpoint, other 4xx, 5xx → FAIL.
+            if code < 400 or code == 405:
+                continue
+            unreachable_required.append(f"{srv}(HTTP {code})")
     if unreachable_required:
         return _fail(
             "mcp-servers",
