@@ -222,12 +222,20 @@ is_mcp_entry_valid() {
   esac
 }
 
-collect_missing_mcp() {
-  local out=()
-  for srv in "${REQUIRED_MCP[@]}"; do
-    is_mcp_entry_valid "$srv" || out+=("$srv")
-  done
-  echo "${out[*]}"
+# Classify each REQUIRED entry as absent | malformed | valid. Distinguish
+# between absent (safe to auto-create from a canonical default) and
+# malformed (an existing user entry that could be intentional but failed
+# our validator — must NOT be silently rewritten because that destroys
+# custom args/env/transport choices).
+classify_mcp() {
+  local srv="$1"
+  jq -e --arg s "$srv" '(.mcpServers // {}) | has($s)' "$CLAUDE_JSON" >/dev/null 2>&1 \
+    || { echo "absent"; return; }
+  if is_mcp_entry_valid "$srv"; then
+    echo "valid"
+  else
+    echo "malformed"
+  fi
 }
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -236,9 +244,22 @@ elif [[ ! -f "$CLAUDE_JSON" ]]; then
   log "ERROR: $CLAUDE_JSON does not exist — MCP registration failed upstream."
   exit 3
 else
-  MISSING="$(collect_missing_mcp)"
-  if [[ " $MISSING " == *" serena "* ]]; then
-    log "  serena MCP missing or malformed in $CLAUDE_JSON — normalizing to canonical"
+  ABSENT_MCP=()
+  MALFORMED_MCP=()
+  for srv in "${REQUIRED_MCP[@]}"; do
+    case "$(classify_mcp "$srv")" in
+      absent)    ABSENT_MCP+=("$srv") ;;
+      malformed) MALFORMED_MCP+=("$srv") ;;
+    esac
+  done
+
+  # Auto-create canonical serena ONLY when the key is ABSENT entirely.
+  # If the user already has a serena entry that fails our validator, we
+  # report and exit instead of overwriting — their entry might be an
+  # intentional custom transport (uvx wrapper, alternate binary path,
+  # etc.) and silently replacing it is a destructive mutation.
+  if printf '%s\n' "${ABSENT_MCP[@]}" | grep -qx serena; then
+    log "  serena MCP absent from $CLAUDE_JSON — installing canonical entry"
     cp "$CLAUDE_JSON" "$CLAUDE_JSON.bak.$(date +%s)"
     SERENA_ENTRY_JSON=$(jq -n --arg home "$HOME" '{
       type: "stdio",
@@ -247,13 +268,30 @@ else
     }')
     jq --argjson entry "$SERENA_ENTRY_JSON" '.mcpServers.serena = $entry' \
       "$CLAUDE_JSON" > "$CLAUDE_JSON.new" && mv "$CLAUDE_JSON.new" "$CLAUDE_JSON"
-    MISSING="$(collect_missing_mcp)"
+    # Re-classify after the write
+    ABSENT_MCP=()
+    MALFORMED_MCP=()
+    for srv in "${REQUIRED_MCP[@]}"; do
+      case "$(classify_mcp "$srv")" in
+        absent)    ABSENT_MCP+=("$srv") ;;
+        malformed) MALFORMED_MCP+=("$srv") ;;
+      esac
+    done
   fi
-  if [[ -n "$MISSING" ]]; then
-    log "ERROR: required MCP servers missing or not executable in $CLAUDE_JSON: $MISSING"
-    log "  For each failing server, confirm the .command path resolves to an executable file."
-    log "  Canonical serena binary: \$HOME/.local/bin/serena-mcp (install via 'pipx install serena-mcp')."
+
+  if (( ${#ABSENT_MCP[@]} > 0 )); then
+    log "ERROR: required MCP servers absent from $CLAUDE_JSON: ${ABSENT_MCP[*]}"
+    log "  Re-run install_mcp_servers.sh after fixing NLR_BIN/TV_BIN paths, or run 'claude mcp add' manually."
+  fi
+  if (( ${#MALFORMED_MCP[@]} > 0 )); then
+    log "ERROR: required MCP servers present but failed validation in $CLAUDE_JSON: ${MALFORMED_MCP[*]}"
+    log "  These entries were NOT auto-rewritten — they may be intentional non-canonical configs."
+    log "  For each, check: stdio entries need an executable .command; http/sse entries need a string .url matching ^https?://"
+    log "  Canonical serena: type=stdio, command=\$HOME/.local/bin/serena-mcp (pipx install serena-mcp)."
     log "  Canonical neuro-link binaries: \$NLR_ROOT/server/target/release/neuro-link (cargo build --release in server/)."
+    log "  Edit \$CLAUDE_JSON by hand to correct, then re-run."
+  fi
+  if (( ${#ABSENT_MCP[@]} > 0 )) || (( ${#MALFORMED_MCP[@]} > 0 )); then
     exit 3
   fi
   log "  MCP validation OK (structural + operational): ${REQUIRED_MCP[*]}"

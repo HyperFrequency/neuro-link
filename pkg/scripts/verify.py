@@ -306,6 +306,8 @@ def _resolve_serena_bin() -> tuple[Path | None, str]:
         path = Path(which)
     if not path.is_file():
         return None, f"serena binary {path} (from ~/.claude.json) missing"
+    if not os.access(path, os.X_OK):
+        return None, f"serena binary {path} (from ~/.claude.json) is not executable (chmod +x or reinstall)"
     return path, str(path)
 
 
