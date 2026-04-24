@@ -292,16 +292,25 @@ if [[ ! -x "$HOME/.local/bin/serena-hooks" && -f "$SETTINGS" ]]; then
   if grep -q 'serena-hooks' "$SETTINGS"; then
     log "  purging stale serena-hooks commands from $SETTINGS (binary absent on this host)"
     POST_STRIP=$(mktemp -t nlr-mirror-post-strip.XXXXXX.json)
-    jq '.hooks |= (
-          with_entries(
-            .value |= (
-              map(.hooks |= map(select(.command | test("serena-hooks") | not)))
-              | map(select((.hooks // []) | length > 0))
+    # Gate-14 GG1: null-safe predicate — `(.command // "") | test(...)`
+    # instead of `.command | test(...)` — so user-added hooks without a
+    # .command field don't crash the purge. And write to a temp first,
+    # validate non-empty, then atomic mv so a jq failure can't leave a
+    # half-mutated live settings.json behind.
+    if jq '.hooks |= (
+            with_entries(
+              .value |= (
+                map(.hooks |= map(select((.command // "") | test("serena-hooks") | not)))
+                | map(select((.hooks // []) | length > 0))
+              )
             )
-          )
-          | with_entries(select(.value | length > 0))
-        )' "$SETTINGS" > "$POST_STRIP" \
-      && run mv "$POST_STRIP" "$SETTINGS"
+            | with_entries(select(.value | length > 0))
+          )' "$SETTINGS" > "$POST_STRIP" && [[ -s "$POST_STRIP" ]]; then
+      run mv "$POST_STRIP" "$SETTINGS"
+    else
+      log "  WARNING: serena-hooks purge failed on $SETTINGS; leaving live settings untouched"
+      rm -f "$POST_STRIP"
+    fi
   fi
 fi
 

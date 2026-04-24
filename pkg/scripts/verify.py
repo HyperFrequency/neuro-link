@@ -123,7 +123,10 @@ def check_multilspy() -> dict[str, Any]:
 
 
 def _validate_mcp_entry(entry: dict[str, Any]) -> str | None:
-    """Mirror of install-mirror.sh's is_mcp_entry_valid. Returns None on
+    """Mirror of install-mirror.sh's is_mcp_entry_valid — STRUCTURAL
+    check only. Validates shape + .command resolves to an executable
+    (stdio) or .url is a well-formed http(s) URL (http/sse). Does NOT
+    probe reachability (no HTTP fetch, no stdio exec). Returns None on
     success, or a short reason string on failure. Transport inferred:
     explicit .type wins, else string .url implies http, else stdio."""
     if not isinstance(entry, dict):
@@ -172,12 +175,16 @@ def check_mcp_servers() -> dict[str, Any]:
     missing_required = [s for s in REQUIRED_MCP_SERVERS if s not in servers]
     if missing_required:
         return _fail("mcp-servers", f"missing required: {','.join(missing_required)}")
-    # Gate-12 EE2: structural + operational validation for REQUIRED
-    # entries matches install-mirror.sh's is_mcp_entry_valid. Without
-    # this, verify.py greenlit stale broken registrations (empty
-    # .command, dangling executable path, malformed URL) that the
-    # installer would have rejected. OPTIONAL entries get the same
-    # check for reporting, but only contribute a warning.
+    # Gate-12 EE2 + Gate-14 GG2: STRUCTURAL validation of REQUIRED
+    # entries matches install-mirror.sh's is_mcp_entry_valid. This
+    # covers shape (object with required fields), .command reachability
+    # for stdio (exists + executable), and .url well-formedness for
+    # http/sse. It does NOT probe reachability — HTTP endpoints are
+    # not fetched and stdio binaries are not started. A dead listener,
+    # wrong port, or stdio binary that exits immediately still passes.
+    # Reachability probing belongs in the live-stack `proof-full` run
+    # after `make full-up`, not here; keeping this check structural-
+    # only avoids flakiness in the `make all` pre-rag path.
     malformed_required: list[str] = []
     for srv in REQUIRED_MCP_SERVERS:
         reason = _validate_mcp_entry(servers[srv])
@@ -192,7 +199,7 @@ def check_mcp_servers() -> dict[str, Any]:
             reason = _validate_mcp_entry(servers[srv])
             if reason is not None:
                 malformed_optional.append(f"{srv}({reason})")
-    note = f"required OK: {','.join(sorted(s for s in servers if s in REQUIRED_MCP_SERVERS))}"
+    note = f"required structurally OK (no reachability probe): {','.join(sorted(s for s in servers if s in REQUIRED_MCP_SERVERS))}"
     if missing_optional:
         note += f"; optional absent: {','.join(missing_optional)}"
     if malformed_optional:
