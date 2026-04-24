@@ -103,15 +103,25 @@ if [[ -f "$SETTINGS" ]]; then
   log "  backing up $SETTINGS → $BACKUP"
   run cp "$SETTINGS" "$BACKUP"
   # Merge: template entries extend existing ones. Existing.permissions.allow
-  # is preserved by concatenating + deduping.
+  # is preserved by concatenating + deduping; hook event arrays are merged
+  # per-event (NOT overwritten — `.[0] * .[1]` replaces the RHS wholesale
+  # which would silently drop any hooks the user wired up outside the
+  # template, e.g. custom PostToolUse entries).
   MERGED=$(mktemp -t nlr-mirror-merged.XXXXXX.json)
-  # Pass existing.allow and template.allow as a computed slot so the final
-  # merge preserves both sets.
   jq -s '
-    (.[0].permissions.allow // []) as $a |
-    (.[1].permissions.allow // []) as $b |
-    (.[0] * .[1]) as $m |
-    $m | .permissions.allow = (($a + $b) | unique)
+    .[0] as $existing | .[1] as $template |
+    ($existing.permissions.allow // []) as $a |
+    ($template.permissions.allow // []) as $b |
+    ($existing.hooks // {}) as $eh |
+    ($template.hooks // {}) as $th |
+    (($eh | keys_unsorted) + ($th | keys_unsorted) | unique) as $events |
+    ($existing * $template)
+    | .permissions.allow = (($a + $b) | unique)
+    | .hooks = (
+        reduce $events[] as $e ({};
+          .[$e] = (($eh[$e] // []) + ($th[$e] // []) | unique)
+        )
+      )
     ' "$SETTINGS" "$TMP_RENDERED" > "$MERGED" || {
     log "  jq merge failed — leaving $SETTINGS untouched; rendered template at $TMP_RENDERED"
     exit 1
@@ -129,7 +139,57 @@ if [[ -x "$MCP_INSTALLER" ]]; then
   run bash "$MCP_INSTALLER"
 else
   log "  WARNING: $MCP_INSTALLER not found or not executable; skipping MCP registration."
-  log "  The three core servers (neuro-link-http, neuro-link-recursive, serena) will need to be registered manually."
+fi
+
+# --- 5. Post-install MCP validation ---
+# install_mcp_servers.sh only registers the two neuro-link servers + turbovault;
+# serena is deliberately out-of-scope there because users often already have
+# it globally. Validate all three REQUIRED servers are present, auto-register
+# serena's canonical entry if missing, and exit 3 if anything remains unset.
+CLAUDE_JSON="${HOME}/.claude.json"
+REQUIRED_MCP=("neuro-link-recursive" "neuro-link-http" "serena")
+if [[ "$DRY_RUN" == "1" ]]; then
+  log "DRY: would validate MCP servers: ${REQUIRED_MCP[*]}"
+elif [[ ! -f "$CLAUDE_JSON" ]]; then
+  log "ERROR: $CLAUDE_JSON does not exist — MCP registration failed upstream."
+  exit 3
+else
+  missing_mcp() {
+    local out=()
+    for srv in "${REQUIRED_MCP[@]}"; do
+      if ! jq -e --arg s "$srv" '.mcpServers[$s]' "$CLAUDE_JSON" >/dev/null 2>&1; then
+        out+=("$srv")
+      fi
+    done
+    echo "${out[*]}"
+  }
+  MISSING="$(missing_mcp)"
+  if [[ " $MISSING " == *" serena "* ]]; then
+    log "  serena MCP absent from $CLAUDE_JSON — installing canonical entry via uvx"
+    cp "$CLAUDE_JSON" "$CLAUDE_JSON.bak.$(date +%s)"
+    SERENA_PATCH=$(mktemp -t nlr-serena-patch.XXXXXX.json)
+    cat > "$SERENA_PATCH" <<'JSON'
+{
+  "mcpServers": {
+    "serena": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server", "--context", "ide-assistant"]
+    }
+  }
+}
+JSON
+    jq -s '.[0] * .[1]' "$CLAUDE_JSON" "$SERENA_PATCH" > "$CLAUDE_JSON.new" \
+      && mv "$CLAUDE_JSON.new" "$CLAUDE_JSON"
+    rm -f "$SERENA_PATCH"
+    MISSING="$(missing_mcp)"
+  fi
+  if [[ -n "$MISSING" ]]; then
+    log "ERROR: required MCP servers still missing from $CLAUDE_JSON: $MISSING"
+    log "  Re-run install_mcp_servers.sh after fixing NLR_BIN/TV_BIN paths, or register manually with 'claude mcp add'."
+    exit 3
+  fi
+  log "  MCP validation OK: ${REQUIRED_MCP[*]}"
 fi
 
 log "DONE. Review $SETTINGS and restart Claude Code to pick up hook changes."

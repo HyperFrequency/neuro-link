@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -258,16 +259,65 @@ def check_serena_arch() -> dict[str, Any]:
     serena_bin = HOME / ".local" / "bin" / "serena-hooks"
     if not serena_bin.is_file():
         return _fail("serena-arch", f"{serena_bin} missing")
-    # Use `file` command to detect Mach-O architecture on macOS
-    rc, out = _run(["file", str(serena_bin)])
+
+    # ~/.local/bin/serena-hooks is usually a pip wrapper script — running
+    # file(1) directly tells you "ASCII text". Resolve symlinks, then
+    # follow shebangs up to two hops so we reach the Python interpreter
+    # the wrapper actually launches. That's the binary whose arch matters.
+    target = serena_bin.resolve()
+    trail: list[str] = [str(target)]
+    for _ in range(2):
+        try:
+            head = target.read_bytes()[:256]
+        except OSError:
+            break
+        if not head.startswith(b"#!"):
+            break
+        shebang = head.split(b"\n", 1)[0][2:].decode("utf-8", "replace").strip()
+        parts = shebang.split()
+        if not parts:
+            break
+        if parts[0].rsplit("/", 1)[-1] == "env" and len(parts) > 1:
+            resolved = shutil.which(parts[1])
+        else:
+            resolved = parts[0]
+        if not resolved:
+            break
+        nxt = Path(resolved).resolve()
+        if nxt == target:
+            break
+        target = nxt
+        trail.append(str(target))
+
+    rc, out = _run(["file", str(target)])
     if rc != 0:
-        return _fail("serena-arch", f"file(1) exit {rc}: {out[:200]}")
+        return _fail("serena-arch", f"file(1) exit {rc} on {target}: {out[:200]}")
+
+    host_arch = platform.machine()
+    trail_s = " -> ".join(trail)
+
     if "arm64" in out:
-        return _pass("serena-arch", "arm64 binary (Apple Silicon native)")
+        return _pass("serena-arch", f"arm64 native ({trail_s})")
     if "x86_64" in out and "arm64" not in out:
-        return _fail("serena-arch", f"x86_64 only (Rosetta) — reinstall for arm64: {out[:200]}")
-    # Shell script / universal binary / something else — best-effort pass.
-    return {"name": "serena-arch", "status": "warn", "note": f"unknown arch signature: {out[:120]}"}
+        return _fail(
+            "serena-arch",
+            f"x86_64-only binary at {target} (Rosetta) — reinstall with arch -arm64 python: {out[:160]}",
+        )
+
+    # Unknown signature. On arm64 hosts the rag stack leans on Metal via
+    # an arm64-native interpreter; ambiguity here almost always means a
+    # misinstall (uv's cpython-3.11 is x86_64 on this host). Hard-fail
+    # instead of the prior warn so the gate actually catches it.
+    if host_arch == "arm64":
+        return _fail(
+            "serena-arch",
+            f"unknown arch on arm64 host — {trail_s}: {out[:160]}",
+        )
+    return {
+        "name": "serena-arch",
+        "status": "warn",
+        "note": f"unknown arch on {host_arch}: {out[:120]}",
+    }
 
 
 # --- Main ----------------------------------------------------------------
