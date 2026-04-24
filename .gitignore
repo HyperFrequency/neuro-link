@@ -57,3 +57,6 @@ scripts/math_ingest/.pytest_cache/
 
 # local-only: dev-split per G7 (batch run 20260422-hf-nq-deployable-a7c3)
 dev/
+
+# Install proof artifacts — generated per-run, never committed
+pkg/.proof/

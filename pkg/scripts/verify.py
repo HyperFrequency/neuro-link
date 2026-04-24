@@ -175,16 +175,15 @@ def check_mcp_servers() -> dict[str, Any]:
     missing_required = [s for s in REQUIRED_MCP_SERVERS if s not in servers]
     if missing_required:
         return _fail("mcp-servers", f"missing required: {','.join(missing_required)}")
-    # Gate-12 EE2 + Gate-14 GG2: STRUCTURAL validation of REQUIRED
-    # entries matches install-mirror.sh's is_mcp_entry_valid. This
-    # covers shape (object with required fields), .command reachability
-    # for stdio (exists + executable), and .url well-formedness for
-    # http/sse. It does NOT probe reachability — HTTP endpoints are
-    # not fetched and stdio binaries are not started. A dead listener,
-    # wrong port, or stdio binary that exits immediately still passes.
-    # Reachability probing belongs in the live-stack `proof-full` run
-    # after `make full-up`, not here; keeping this check structural-
-    # only avoids flakiness in the `make all` pre-rag path.
+    # Gate-12 EE2 + Gate-14 GG2 + Gate-15 HH1: structural validation of
+    # REQUIRED entries (shape + .command executable for stdio + .url
+    # well-formed for http/sse), PLUS a short-timeout reachability
+    # probe for http/sse transports. The probe closes the "dead
+    # listener / wrong port" hole that pure metadata checks missed.
+    # stdio entries are NOT auto-started (too variable across servers);
+    # their operational correctness surfaces at Claude's first tool
+    # call instead. NLR_VERIFY_OFFLINE=1 skips the network probe, so
+    # `make all`→`make proof` still runs offline.
     malformed_required: list[str] = []
     for srv in REQUIRED_MCP_SERVERS:
         reason = _validate_mcp_entry(servers[srv])
@@ -192,6 +191,36 @@ def check_mcp_servers() -> dict[str, Any]:
             malformed_required.append(f"{srv}({reason})")
     if malformed_required:
         return _fail("mcp-servers", f"required registered but invalid: {'; '.join(malformed_required)}")
+
+    unreachable_required: list[str] = []
+    if not OFFLINE:
+        for srv in REQUIRED_MCP_SERVERS:
+            entry = servers[srv]
+            transport = entry.get("type") or ("http" if isinstance(entry.get("url"), str) else "stdio")
+            if transport not in ("http", "sse"):
+                continue
+            url = entry.get("url", "")
+            # Tolerate both /mcp endpoints (which may 405 on GET) and
+            # /health-style endpoints. Accept any HTTP status < 500
+            # as "listener is up"; only timeouts / refused connections
+            # count as unreachable. 2-second cap keeps proof under a
+            # few seconds total even when all listeners are down.
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                    if resp.status >= 500:
+                        unreachable_required.append(f"{srv}(HTTP {resp.status})")
+            except urllib.error.HTTPError as e:
+                if e.code >= 500:
+                    unreachable_required.append(f"{srv}(HTTP {e.code})")
+            except Exception as e:
+                unreachable_required.append(f"{srv}({type(e).__name__})")
+    if unreachable_required:
+        return _fail(
+            "mcp-servers",
+            f"required http/sse listeners unreachable: {'; '.join(unreachable_required)} (NLR_VERIFY_OFFLINE=1 to skip)",
+        )
+
     missing_optional = [s for s in OPTIONAL_MCP_SERVERS if s not in servers]
     malformed_optional: list[str] = []
     for srv in OPTIONAL_MCP_SERVERS:
@@ -199,7 +228,8 @@ def check_mcp_servers() -> dict[str, Any]:
             reason = _validate_mcp_entry(servers[srv])
             if reason is not None:
                 malformed_optional.append(f"{srv}({reason})")
-    note = f"required structurally OK (no reachability probe): {','.join(sorted(s for s in servers if s in REQUIRED_MCP_SERVERS))}"
+    probe_note = "struct + http probe" if not OFFLINE else "struct only (OFFLINE)"
+    note = f"required {probe_note} OK: {','.join(sorted(s for s in servers if s in REQUIRED_MCP_SERVERS))}"
     if missing_optional:
         note += f"; optional absent: {','.join(missing_optional)}"
     if malformed_optional:

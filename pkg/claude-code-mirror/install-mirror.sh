@@ -265,7 +265,17 @@ if [[ -f "$SETTINGS" ]]; then
                 # flags, etc.) survive instead of being stripped down
                 # to a bare {matcher, hooks}.
                 .[0]
-                + { hooks: (map(.hooks // []) | add | unique_by(.command)) }
+                # Gate-15 HH3: `unique_by(.command)` collapses every
+                # commandless entry (they all map to null), which can
+                # silently drop multiple distinct non-command hooks a
+                # user added. Split into command-having (dedupe by
+                # .command) and commandless (dedupe by full object);
+                # concatenate so both sets survive.
+                + { hooks: (
+                    (map(.hooks // []) | add) as $all
+                    | ($all | map(select(has("command"))) | unique_by(.command))
+                    + ($all | map(select(has("command") | not)) | unique)
+                  ) }
               )
           )
         )
