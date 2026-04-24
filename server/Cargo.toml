@@ -2,9 +2,9 @@
 name = "neuro-link-mcp"
 version = "0.2.0"
 edition = "2021"
-description = "Unified MCP server + CLI for neuro-link-recursive — hybrid RAG, LLM-Wiki, reasoning ontologies, and harness bridge"
+description = "Unified MCP server + CLI for neuro-link — hybrid RAG, LLM-Wiki, reasoning ontologies, and harness bridge"
 license = "MIT"
-repository = "https://github.com/HyperFrequency/neuro-link-recursive"
+repository = "https://github.com/HyperFrequency/neuro-link"
 
 [[bin]]
 name = "neuro-link"
