@@ -45,6 +45,96 @@ for bin in jq envsubst; do
   fi
 done
 
+# --- MCP validation helpers + pre-mutation guard ---
+# Runs BEFORE sections 1-3 (hooks merge, settings merge) so if a
+# required MCP entry is present-but-malformed we exit 3 with ZERO
+# mutations anywhere: not hooks, not settings.json, not ~/.claude.json.
+# install_mcp_servers.sh (called by section 4) does a destructive
+# `jq -s '.[0] * .[1]'` merge that would overwrite a user's custom
+# neuro-link-http or neuro-link-recursive entries, so catching the
+# invalid-but-present case before any write is the only way to
+# guarantee atomic retries.
+CLAUDE_JSON="${HOME}/.claude.json"
+REQUIRED_MCP=("neuro-link-recursive" "neuro-link-http" "serena")
+
+_expand_cmd() {
+  # Expand the env-var placeholders we actually write into config
+  # (${HOME}, $HOME, leading ~). Exotic forms fall through and fail
+  # the -x check below, which is the correct outcome.
+  local v="$1"
+  v="${v//\$\{HOME\}/$HOME}"
+  v="${v//\$HOME/$HOME}"
+  v="${v/#~/$HOME}"
+  printf '%s' "$v"
+}
+
+is_mcp_entry_valid() {
+  # Validate by transport type. stdio entries need an executable
+  # .command; http/sse entries need a string .url matching ^https?://.
+  local srv="$1"
+  local entry_type
+  entry_type=$(jq -r --arg s "$srv" \
+    '.mcpServers[$s].type // (if (.mcpServers[$s].url | type) == "string" then "http" else "stdio" end) // "stdio"' \
+    "$CLAUDE_JSON" 2>/dev/null)
+  case "$entry_type" in
+    stdio)
+      jq -e --arg s "$srv" '
+        .mcpServers[$s] as $e
+        | if ($e | type) != "object" then false
+          elif ($e.command | type) != "string" then false
+          elif ($e.command | length) == 0 then false
+          else true end
+        ' "$CLAUDE_JSON" >/dev/null 2>&1 || return 1
+      local cmd
+      cmd=$(jq -r --arg s "$srv" '.mcpServers[$s].command' "$CLAUDE_JSON")
+      cmd="$(_expand_cmd "$cmd")"
+      if [[ "$cmd" == /* ]]; then
+        [[ -x "$cmd" ]]
+      else
+        command -v "$cmd" >/dev/null 2>&1
+      fi
+      ;;
+    http|sse)
+      jq -e --arg s "$srv" '
+        .mcpServers[$s] as $e
+        | if ($e | type) != "object" then false
+          elif ($e.url | type) != "string" then false
+          elif ($e.url | test("^https?://")) then true
+          else false end
+        ' "$CLAUDE_JSON" >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+classify_mcp() {
+  local srv="$1"
+  jq -e --arg s "$srv" '(.mcpServers // {}) | has($s)' "$CLAUDE_JSON" >/dev/null 2>&1 \
+    || { echo "absent"; return; }
+  if is_mcp_entry_valid "$srv"; then echo "valid"; else echo "malformed"; fi
+}
+
+# Atomic pre-mutation guard: if any required entry is present but
+# invalid, bail out before any write touches the filesystem.
+if [[ "$DRY_RUN" != "1" && -f "$CLAUDE_JSON" ]]; then
+  PREMUT_MALFORMED=()
+  for srv in "${REQUIRED_MCP[@]}"; do
+    [[ "$(classify_mcp "$srv")" == "malformed" ]] && PREMUT_MALFORMED+=("$srv")
+  done
+  if (( ${#PREMUT_MALFORMED[@]} > 0 )); then
+    log "ERROR: required MCP entries present in $CLAUDE_JSON but failed validation:"
+    log "       ${PREMUT_MALFORMED[*]}"
+    log "  install-mirror.sh exits BEFORE any hook/settings/mcp mutation so your"
+    log "  existing config is preserved. Fix each entry by hand to retain any custom"
+    log "  args/env/transport choices, then re-run. Validators:"
+    log "    stdio entries: .command must be a non-empty string resolving to an executable file"
+    log "    http/sse entries: .url must be a string matching ^https?://"
+    exit 3
+  fi
+fi
+
 # --- 1. Warn before touching an existing ~/.claude/ ---
 if [[ -d "$CLAUDE_HOME" && "$FORCE" != "1" ]]; then
   log "Existing ~/.claude/ detected at $CLAUDE_HOME."
@@ -147,111 +237,7 @@ else
   run cp "$TMP_RENDERED" "$SETTINGS"
 fi
 
-# --- MCP validation helpers (used in sections 4 + 6) ---
-# Defined here, before the MCP_INSTALLER call, so the pre-mutation guard
-# can run BEFORE install_mcp_servers.sh — the installer's `jq -s '.[0] *
-# .[1]'` merge is destructive (overwrites existing required MCP entries
-# wholesale), so we must classify and bail out without ever invoking it
-# when the user has a present-but-invalid entry that must not be lost.
-CLAUDE_JSON="${HOME}/.claude.json"
-REQUIRED_MCP=("neuro-link-recursive" "neuro-link-http" "serena")
-
-_expand_cmd() {
-  # Expand the env-var placeholders we actually write into config
-  # (${HOME}, $HOME, leading ~). Exotic forms are intentionally left
-  # alone — they'll fail the -x check below, which is correct.
-  local v="$1"
-  v="${v//\$\{HOME\}/$HOME}"
-  v="${v//\$HOME/$HOME}"
-  v="${v/#~/$HOME}"
-  printf '%s' "$v"
-}
-
-is_mcp_entry_valid() {
-  # Validate by transport type. stdio entries must have an executable
-  # .command; http/sse entries must have a well-formed .url. The earlier
-  # version applied the stdio check to all transports, which incorrectly
-  # rejected neuro-link-http (a legitimate {type:"http",url:...} entry
-  # with no .command field).
-  local srv="$1"
-  local entry_type
-  entry_type=$(jq -r --arg s "$srv" \
-    '.mcpServers[$s].type // (if (.mcpServers[$s].url | type) == "string" then "http" else "stdio" end) // "stdio"' \
-    "$CLAUDE_JSON" 2>/dev/null)
-  case "$entry_type" in
-    stdio)
-      jq -e --arg s "$srv" '
-        .mcpServers[$s] as $e
-        | if ($e | type) != "object" then false
-          elif ($e.command | type) != "string" then false
-          elif ($e.command | length) == 0 then false
-          else true end
-        ' "$CLAUDE_JSON" >/dev/null 2>&1 || return 1
-      local cmd
-      cmd=$(jq -r --arg s "$srv" '.mcpServers[$s].command' "$CLAUDE_JSON")
-      cmd="$(_expand_cmd "$cmd")"
-      if [[ "$cmd" == /* ]]; then
-        [[ -x "$cmd" ]]
-      else
-        command -v "$cmd" >/dev/null 2>&1
-      fi
-      ;;
-    http|sse)
-      jq -e --arg s "$srv" '
-        .mcpServers[$s] as $e
-        | if ($e | type) != "object" then false
-          elif ($e.url | type) != "string" then false
-          elif ($e.url | test("^https?://")) then true
-          else false end
-        ' "$CLAUDE_JSON" >/dev/null 2>&1
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-# Classify each REQUIRED entry as absent | malformed | valid. Distinguish
-# between absent (safe to auto-create from a canonical default) and
-# malformed (an existing user entry that could be intentional but failed
-# our validator — must NOT be silently rewritten because that destroys
-# custom args/env/transport choices).
-classify_mcp() {
-  local srv="$1"
-  jq -e --arg s "$srv" '(.mcpServers // {}) | has($s)' "$CLAUDE_JSON" >/dev/null 2>&1 \
-    || { echo "absent"; return; }
-  if is_mcp_entry_valid "$srv"; then
-    echo "valid"
-  else
-    echo "malformed"
-  fi
-}
-
-# --- 4. Pre-MCP classification (no mutation) ---
-# install_mcp_servers.sh uses `jq -s '.[0] * .[1]'` which OVERWRITES
-# existing required MCP entries wholesale. If the user has an existing
-# but invalid entry for any of REQUIRED_MCP, we must report and exit
-# BEFORE the destructive call so their (possibly-intentional, custom-
-# transport) entry isn't silently clobbered. Only after a clean
-# pre-check does section 5 invoke the installer.
-if [[ "$DRY_RUN" != "1" && -f "$CLAUDE_JSON" ]]; then
-  PREMUT_MALFORMED=()
-  for srv in "${REQUIRED_MCP[@]}"; do
-    [[ "$(classify_mcp "$srv")" == "malformed" ]] && PREMUT_MALFORMED+=("$srv")
-  done
-  if (( ${#PREMUT_MALFORMED[@]} > 0 )); then
-    log "ERROR: required MCP entries present in $CLAUDE_JSON but failed validation:"
-    log "       ${PREMUT_MALFORMED[*]}"
-    log "  install_mcp_servers.sh would overwrite these (its jq merge is destructive),"
-    log "  so we exit BEFORE running it. Fix each entry by hand to preserve any custom"
-    log "  args/env/transport choices, then re-run. Validators:"
-    log "    stdio entries: .command must be a non-empty string resolving to an executable file"
-    log "    http/sse entries: .url must be a string matching ^https?://"
-    exit 3
-  fi
-fi
-
-# --- 5. Register MCP servers ---
+# --- 4. Register MCP servers ---
 log "Registering MCP servers via install_mcp_servers.sh"
 MCP_INSTALLER="$REPO_ROOT/.claude/skills/neuro-link-setup/scripts/install_mcp_servers.sh"
 if [[ -x "$MCP_INSTALLER" ]]; then
@@ -260,7 +246,7 @@ else
   log "  WARNING: $MCP_INSTALLER not found or not executable; skipping MCP registration."
 fi
 
-# --- 6. Post-install MCP validation ---
+# --- 5. Post-install MCP validation ---
 # At this point the pre-mutation guard above guaranteed any required
 # entries that EXISTED were valid; install_mcp_servers.sh just added
 # the missing canonical entries. Re-classify to confirm + auto-create

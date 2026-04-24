@@ -73,8 +73,15 @@ services:
     # missing (i.e. `make models` hasn't run), compose fails to parse
     # this service, surfacing the real prerequisite instead of starting
     # llama-embed against a non-existent file.
+    # Default NLR_MODELS_DIR (../../models) resolves relative to this
+    # compose file: pkg/docker/../../models = <neuro-link repo root>/models
+    # — the exact path download_models.sh writes to when invoked with the
+    # same unset env. That keeps the download artifact and the serve
+    # mount aligned without relying on a shared shell env. Override by
+    # exporting NLR_MODELS_DIR=/abs/path before BOTH `make models` and
+    # `docker compose up`.
     env_file:
-      - ${NLR_MODELS_DIR:-~/neuro-link-models}/.octen-manifest.env
+      - ${NLR_MODELS_DIR:-../../models}/.octen-manifest.env
     command: >
       --embeddings
       --model /models/Octen-Embedding-8B.${OCTEN_VARIANT:-f16}.gguf
@@ -82,9 +89,7 @@ services:
       --ctx-size 4096 --batch-size 512 --threads 8 --no-warmup
     ports: ["8400:8400"]
     volumes:
-      # Bind-mount the EXACT path the manifest declares — see env_file
-      # above. Named volumes don't cover the 15 GB GGUF.
-      - ${NLR_MODELS_DIR:-~/neuro-link-models}:/models:ro
+      - ${NLR_MODELS_DIR:-../../models}:/models:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8400/health | grep -q 200"]
       interval: 10s
