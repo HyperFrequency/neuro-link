@@ -1,37 +1,44 @@
-//! qmd subprocess client — shells out to the `qmd` CLI to run BM25 + vector
-//! + optional rerank over a local qmd sqlite collection. Parses the JSON
-//! list qmd emits on stdout and returns typed hits.
+//! RAG orchestrator — two complementary retrieval paths:
 //!
-//! This is the Rust side of the contract documented at
-//! `deep-tool-wiki/qmd/code.md §2`. The qmd binary is expected on `$PATH`
-//! (pkg/pyproject.toml ensures `qmd>=0.1.2` is installed in the user's venv
-//! and `pkg/<target>/build.sh` stages the venv's `bin/` on PATH for the
-//! launched neuro-link process).
+//! # Path A — Octen-backed (primary, nlr_wiki qdrant, 4096-dim)
 //!
-//! # Embedder note
+//! The canonical neuro-link pipeline: **Octen-Embedding-8B (f16 GGUF) via
+//! llama-server :8400 → qdrant `nlr_wiki` → Qwen3-Reranker via llama-server
+//! :8401**. All three layers are warm HTTP services (see
+//! `pkg/docker/compose.yaml` profile `rag`); no cold-model loading per query.
 //!
-//! qmd 0.1.2 uses `Qwen/Qwen3-Embedding-0.6B` (1024-dim) by default, NOT
-//! the Octen-Embedding-8B (4096-dim) that backs neuro-link's nlr_wiki
-//! qdrant collection. Callers must choose:
-//! - `QmdClient::search` → qmd's sqlite (1024-dim; scope = deep-tool-wiki
-//!   pages ingested via `scripts/ingest_deep_tool_wiki_into_qmd.sh`)
-//! - `crate::embed::qdrant_search` (elsewhere in this crate) → nlr_wiki
-//!   (4096-dim; scope = 02-KB-main wiki pages embedded via llama-server :8400)
+//! Use this path for anything indexed in 02-KB-main/ (the llm-wiki).
+//! Queries embed in ~10-50ms (p95), qdrant search ~5-20ms, rerank ~50-150ms.
+//! Target p95 for the full pipeline: <300ms.
 //!
-//! For the bridging MCP tool `nlr_rag_query`, the recommended routing
-//! (added in a follow-up PR) is:
-//! 1. qmd path for queries that target deep-tool-wiki (BM25 keyword
-//!    dominates) — benefits most from rerank
-//! 2. qdrant-direct path for queries targeting 02-KB-main (dense semantic
-//!    dominates) — low-latency
+//! Entry point: [`octen_search`] — takes a plain-text query, returns a
+//! reranked list of hits with qdrant payloads + Qwen3 rerank scores.
+//!
+//! # Path B — qmd subprocess (secondary, dtw_wiki sqlite, 1024-dim)
+//!
+//! For deep-tool-wiki content where BM25 keyword dominates (tool API names,
+//! specific function references), qmd 0.1.2's sqlite-backed search is a
+//! better fit. qmd uses its own `Qwen/Qwen3-Embedding-0.6B` (1024-dim)
+//! internally — NOT Octen-8B. Ingest via
+//! `scripts/ingest_deep_tool_wiki_into_qmd.sh`. This path is primarily
+//! BM25+rerank; dense embeddings live inside qmd's sqlite, separate from
+//! neuro-link's qdrant.
+//!
+//! Entry point: [`QmdClient::search`] — shells out to the `qmd` CLI.
+//!
+//! # MCP routing recommendation
+//!
+//! For `mcp__neuro-link-http__nlr_rag_query`:
+//! - If the query contains named library symbols (vectorbtpro::*,
+//!   nautilus_trader::*, etc.) → Path B (qmd+BM25 excels at symbol lookup)
+//! - Otherwise → Path A (Octen-backed dense semantic)
+//! - For ambiguous queries, run both + RRF-merge (see `tools/rag.rs`).
 //!
 //! # Tests
 //!
-//! The `#[cfg(test)]` module below uses a small mock-stdout pattern
-//! (injectable via `QmdClient::with_raw_stdout`) so CI doesn't need
-//! the qmd binary. An integration-style test that actually invokes
-//! `qmd --help` is gated behind `--features docker_tests` to mirror
-//! the existing pattern in the crate.
+//! Unit tests in `#[cfg(test)]` use injectable stdout-parsing + JSON-body
+//! parsing to avoid needing live llama-server/qmd at CI time. Integration
+//! tests that hit real services are gated behind `--features docker_tests`.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -158,6 +165,230 @@ pub(crate) fn parse_qmd_stdout(stdout: &[u8]) -> Result<Vec<QmdHit>> {
     Ok(hits)
 }
 
+// ============================================================================
+// Path A — Octen-backed RAG via warm llama-server :8400 + qdrant + :8401 rerank
+// ============================================================================
+
+/// One hit from the Octen-backed RAG pipeline. Separate from `QmdHit` because
+/// the payload shape comes from qdrant (caller-controlled), not qmd.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct OctenHit {
+    /// Qdrant point id.
+    pub id: String,
+    /// Qdrant cosine-similarity score (0.0–1.0) against the query vector.
+    pub vector_score: f32,
+    /// Qwen3-Reranker score (0.0–1.0). Present iff `rerank=true`.
+    #[serde(default)]
+    pub rerank_score: Option<f32>,
+    /// Passthrough of qdrant's payload — typically includes `title`, `path`,
+    /// `domain`, `chunk_index`, etc. for nlr_wiki points.
+    pub payload: serde_json::Value,
+}
+
+/// Full-pipeline query: embed via Octen → qdrant top-K → optional Qwen3 rerank.
+///
+/// - `embedding_url`: typically `http://localhost:8400/v1/embeddings` (matches
+///   the existing `embed.rs` convention; OpenAI-compatible llama-server format).
+/// - `embedding_model`: the model name llama-server reports via /v1/models
+///   (e.g. `Octen-Embedding-8B.f16`). Used for server-side routing when
+///   multiple models are loaded.
+/// - `qdrant_url`: `http://localhost:6333` (no trailing slash).
+/// - `collection`: `nlr_wiki` for the canonical 02-KB-main index.
+/// - `rerank_url`: `http://localhost:8401/reranking` (llama-server reranking
+///   mode). When `None`, skip rerank and return qdrant's raw top-K ordering.
+pub async fn octen_search(
+    http: &reqwest::Client,
+    query: &str,
+    top_k: usize,
+    embedding_url: &str,
+    embedding_model: &str,
+    qdrant_url: &str,
+    collection: &str,
+    rerank_url: Option<&str>,
+) -> Result<Vec<OctenHit>> {
+    // 1. Embed query via llama-server :8400 (Octen-8B, 4096-dim)
+    let embed_resp = http
+        .post(embedding_url)
+        .json(&serde_json::json!({
+            "model": embedding_model,
+            "input": query,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("POST {embedding_url} (query embed)"))?
+        .error_for_status()
+        .with_context(|| format!("{embedding_url} returned non-2xx"))?;
+    let embed_body: serde_json::Value = embed_resp.json().await?;
+    let vector = parse_openai_embedding(&embed_body)?;
+
+    // 2. Qdrant top-K (over-fetch if reranking; rerank narrows)
+    let fetch_k = if rerank_url.is_some() {
+        (top_k * 4).max(20).min(100)
+    } else {
+        top_k
+    };
+    let search_url = format!("{qdrant_url}/collections/{collection}/points/search");
+    let search_resp = http
+        .post(&search_url)
+        .json(&serde_json::json!({
+            "vector": vector,
+            "limit": fetch_k,
+            "with_payload": true,
+            "with_vector": false,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("POST {search_url}"))?
+        .error_for_status()
+        .with_context(|| format!("qdrant search returned non-2xx"))?;
+    let search_body: serde_json::Value = search_resp.json().await?;
+    let mut hits = parse_qdrant_search(&search_body)?;
+
+    // 3. Optional rerank via llama-server :8401 (Qwen3-Reranker)
+    if let Some(rurl) = rerank_url {
+        if !hits.is_empty() {
+            let texts: Vec<String> = hits
+                .iter()
+                .map(|h| payload_to_rerank_text(&h.payload))
+                .collect();
+            match run_qwen_rerank(http, rurl, query, &texts).await {
+                Ok(scores) => {
+                    for (h, s) in hits.iter_mut().zip(scores.into_iter()) {
+                        h.rerank_score = Some(s);
+                    }
+                    // Sort by rerank_score desc (None last)
+                    hits.sort_by(|a, b| {
+                        b.rerank_score
+                            .unwrap_or(f32::NEG_INFINITY)
+                            .partial_cmp(&a.rerank_score.unwrap_or(f32::NEG_INFINITY))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "rag::octen_search rerank failed ({}); returning qdrant-only ordering",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    hits.truncate(top_k);
+    Ok(hits)
+}
+
+/// Parse OpenAI-compatible `{data: [{embedding: [...]}]}` response body.
+pub(crate) fn parse_openai_embedding(body: &serde_json::Value) -> Result<Vec<f32>> {
+    body["data"][0]["embedding"]
+        .as_array()
+        .ok_or_else(|| anyhow!("response missing data[0].embedding array"))?
+        .iter()
+        .map(|v| {
+            v.as_f64()
+                .map(|f| f as f32)
+                .ok_or_else(|| anyhow!("embedding element not a float"))
+        })
+        .collect()
+}
+
+/// Parse qdrant `{result: [{id, score, payload}]}` search body.
+pub(crate) fn parse_qdrant_search(body: &serde_json::Value) -> Result<Vec<OctenHit>> {
+    let arr = body["result"]
+        .as_array()
+        .ok_or_else(|| anyhow!("qdrant response missing result[] array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for p in arr {
+        let id = match &p["id"] {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            other => {
+                return Err(anyhow!("qdrant point id unexpected shape: {other}"));
+            }
+        };
+        let vector_score = p["score"]
+            .as_f64()
+            .map(|f| f as f32)
+            .ok_or_else(|| anyhow!("qdrant point missing score"))?;
+        let payload = p["payload"].clone();
+        out.push(OctenHit {
+            id,
+            vector_score,
+            rerank_score: None,
+            payload,
+        });
+    }
+    Ok(out)
+}
+
+/// Extract text from a qdrant payload for rerank. Prefers `text` field, then
+/// `content`, then falls back to JSON stringification.
+fn payload_to_rerank_text(payload: &serde_json::Value) -> String {
+    if let Some(s) = payload.get("text").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    if let Some(s) = payload.get("content").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    if let Some(s) = payload.get("title").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    payload.to_string()
+}
+
+/// Call llama-server's /reranking endpoint with a query + list of documents.
+/// Returns one rerank score per input document, preserving order.
+///
+/// llama-server reranking API format (as of 2026-04 releases):
+/// ```json
+/// { "query": "<q>", "documents": ["<d1>", "<d2>"] }
+/// → { "results": [{"index": 0, "relevance_score": 0.87}, ...] }
+/// ```
+pub(crate) async fn run_qwen_rerank(
+    http: &reqwest::Client,
+    rerank_url: &str,
+    query: &str,
+    documents: &[String],
+) -> Result<Vec<f32>> {
+    let resp = http
+        .post(rerank_url)
+        .json(&serde_json::json!({
+            "query": query,
+            "documents": documents,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("POST {rerank_url}"))?
+        .error_for_status()
+        .with_context(|| format!("rerank server returned non-2xx"))?;
+    let body: serde_json::Value = resp.json().await?;
+    parse_rerank_response(&body, documents.len())
+}
+
+pub(crate) fn parse_rerank_response(body: &serde_json::Value, n: usize) -> Result<Vec<f32>> {
+    let results = body["results"]
+        .as_array()
+        .ok_or_else(|| anyhow!("rerank response missing results[] array"))?;
+    let mut scores = vec![0.0f32; n];
+    for r in results {
+        let idx = r["index"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("rerank result missing index"))? as usize;
+        let score = r["relevance_score"]
+            .as_f64()
+            .map(|f| f as f32)
+            .ok_or_else(|| anyhow!("rerank result missing relevance_score"))?;
+        if idx < n {
+            scores[idx] = score;
+        }
+    }
+    Ok(scores)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +426,96 @@ mod tests {
         let err = parse_qmd_stdout(b"this is not json").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("stdout was:"), "msg was: {msg}");
+    }
+
+    // Path A (Octen-backed) tests — pure parsers, no network
+
+    #[test]
+    fn parse_openai_embedding_ok() {
+        let body = serde_json::json!({
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "embedding": [0.1, 0.2, 0.3, -0.4],
+                "index": 0
+            }],
+            "model": "Octen-Embedding-8B.f16",
+            "usage": {"prompt_tokens": 7, "total_tokens": 7}
+        });
+        let v = parse_openai_embedding(&body).unwrap();
+        assert_eq!(v, vec![0.1f32, 0.2, 0.3, -0.4]);
+    }
+
+    #[test]
+    fn parse_openai_embedding_missing_data_errors() {
+        let body = serde_json::json!({"error": "nope"});
+        let err = parse_openai_embedding(&body).unwrap_err();
+        assert!(err.to_string().contains("data[0].embedding"));
+    }
+
+    #[test]
+    fn parse_qdrant_search_ok() {
+        let body = serde_json::json!({
+            "result": [
+                {
+                    "id": "abc-123",
+                    "score": 0.873,
+                    "payload": {
+                        "title": "vectorbtpro/wiki.md",
+                        "domain": "vectorbtpro",
+                        "text": "Portfolio.from_signals fill timing..."
+                    }
+                },
+                {
+                    "id": 42,
+                    "score": 0.721,
+                    "payload": {"title": "pine-script/pitfalls.md"}
+                }
+            ],
+            "status": "ok"
+        });
+        let hits = parse_qdrant_search(&body).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "abc-123");
+        assert!((hits[0].vector_score - 0.873).abs() < 1e-5);
+        assert_eq!(hits[0].rerank_score, None);
+        assert_eq!(
+            hits[0].payload.get("title").and_then(|v| v.as_str()),
+            Some("vectorbtpro/wiki.md")
+        );
+        // Numeric id case
+        assert_eq!(hits[1].id, "42");
+    }
+
+    #[test]
+    fn parse_rerank_response_ok() {
+        let body = serde_json::json!({
+            "results": [
+                {"index": 0, "relevance_score": 0.88},
+                {"index": 2, "relevance_score": 0.42},
+                {"index": 1, "relevance_score": 0.31}
+            ]
+        });
+        let scores = parse_rerank_response(&body, 3).unwrap();
+        assert!((scores[0] - 0.88).abs() < 1e-5);
+        assert!((scores[1] - 0.31).abs() < 1e-5);
+        assert!((scores[2] - 0.42).abs() < 1e-5);
+    }
+
+    #[test]
+    fn payload_to_rerank_text_prefers_text_field() {
+        let p = serde_json::json!({
+            "text": "the body",
+            "content": "alt body",
+            "title": "T"
+        });
+        assert_eq!(payload_to_rerank_text(&p), "the body");
+
+        let p2 = serde_json::json!({"title": "just a title"});
+        assert_eq!(payload_to_rerank_text(&p2), "just a title");
+
+        let p3 = serde_json::json!({"foo": "bar"});
+        // Falls through to JSON stringification
+        assert!(payload_to_rerank_text(&p3).contains("foo"));
     }
 }
