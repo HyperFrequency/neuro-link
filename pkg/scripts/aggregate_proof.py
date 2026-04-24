@@ -26,6 +26,20 @@ EXPECTED_TARGETS = [
 ]
 
 
+def discover_targets(root: Path) -> list[str]:
+    """Union EXPECTED_TARGETS (required floor) with any *.ready.json found on disk.
+
+    EXPECTED_TARGETS remains the contract: missing core targets still report
+    "missing" state. New targets that land a .ready.json get picked up without
+    a code edit. Added 2026-04-24 (run 20260424-hf-monorepo-deploy-278fae
+    Round 1 swe-05).
+    """
+    if not root.exists():
+        return list(EXPECTED_TARGETS)
+    found = {p.name.removesuffix(".ready.json") for p in root.glob("*.ready.json")}
+    return sorted(set(EXPECTED_TARGETS) | found)
+
+
 def main(proof_dir: str) -> int:
     root = Path(proof_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -36,7 +50,7 @@ def main(proof_dir: str) -> int:
         "green": False,
     }
     all_green = True
-    for tgt in EXPECTED_TARGETS:
+    for tgt in discover_targets(root):
         p = root / f"{tgt}.ready.json"
         if not p.exists():
             report["targets"][tgt] = {"state": "missing"}
