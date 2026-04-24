@@ -1,0 +1,39 @@
+# pkg/macos/system-deps.txt — macOS arm64 system dependencies
+# Install via: arch -arm64 brew install <each line>
+# Verified on: Apple Silicon / macOS 14+ (Sonoma) / arm64 Homebrew at /opt/homebrew
+# Run: bash pkg/macos/install-system-deps.sh (generated from this file)
+#
+# Format: one package per line; # comments ignored; blank lines ignored;
+# `brew-cask:` prefix for cask-installed apps; `optional:` prefix for non-blocking
+
+# Toolchain — required
+rustup-init                   # → rustc + cargo (pinned via rust-toolchain.toml; 1.90+)
+python@3.13                   # harness-venv base
+uv                            # venv + lock-file manager
+node@20                       # obsidian-plugin + frontend tooling
+pnpm                          # monorepo package manager
+
+# CLI utilities — required
+gh                            # GitHub CLI for PRs + credential helper
+jq                            # JSON manipulation in build scripts
+tmux                          # required by /gigaprompt --fullauto in-place-relay
+git-delta                     # nicer git diffs; optional but used by devtools
+ripgrep                       # fast repo scanning, used by lsp-grader.py
+
+# Build + runtime — required
+cmake                         # native extension builds
+pkg-config                    # openssl-sys + other native dep discovery
+openssl@3                     # TLS for Rust reqwest; matches rust:1.90-slim-bookworm runtime
+llama.cpp                     # GGUF embedder (llama-server)
+
+# Containers — required
+brew-cask:docker              # Docker Desktop — arm64 native; llm-instructions below if unavailable
+
+# Databases — required
+neo4j                         # reasoning ontology store; brew-installed as alternative to docker
+# qdrant ships as docker container; no brew formula
+
+# Optional — dashboards + dev ergonomics
+optional:jupyterlab           # local exploration; optuna-dashboard runs independently
+optional:caddy                # reverse-proxy for TurboVault bearer-auth
+optional:ngrok                # public-face tunneling

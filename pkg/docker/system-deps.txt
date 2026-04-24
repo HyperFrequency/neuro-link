@@ -1,0 +1,17 @@
+# pkg/docker/system-deps.txt — host dependencies for the docker deploy target
+# The docker target ships a container image; host only needs docker + buildx.
+#
+# macOS (via brew):
+#   brew install --cask docker         # Docker Desktop includes buildx
+#
+# Linux (via official Docker repo):
+#   curl -fsSL https://get.docker.com | sudo sh
+#   sudo usermod -aG docker $USER && newgrp docker
+#
+# Verify:
+#   docker buildx version              # expects 0.20+
+#   docker info --format '{{.Architecture}}'
+
+docker                        # 24.0+ (engine)
+docker-buildx-plugin          # 0.20+ (multi-platform builds)
+docker-compose-plugin         # 2.29+ (compose v2)

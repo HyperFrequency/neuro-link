@@ -4,8 +4,9 @@
 #   dist/neuro-link-<version>-linux-aarch64.tar.gz
 #   $PROOF_DIR/linux-aarch64.ready.json   (state:"ready" with sha256, smoke, target_arch)
 #
-# Same pattern as linux-x86_64 but --platform linux/arm64. On Apple silicon the
-# build is native (no emulation); on x86 hosts, buildx uses qemu.
+# Same pattern as linux-x86_64 but --platform linux/arm64, built via
+# rust:1.90-slim-bookworm → debian:bookworm-slim. On Apple silicon the build
+# is native (no emulation); on x86 hosts, buildx uses qemu.
 
 set -euo pipefail
 

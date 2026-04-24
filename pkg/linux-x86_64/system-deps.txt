@@ -1,0 +1,36 @@
+# pkg/linux-x86_64/system-deps.txt — Ubuntu/Debian 12+ amd64 system dependencies
+# Install via: sudo apt-get install -y <each non-comment line>
+# Fedora/RHEL equivalents in parens; install via `sudo dnf install <pkg>` for the first alternative.
+#
+# Format: one package per line; # comments ignored; blank lines ignored;
+# `optional:` prefix for non-blocking extras
+
+# Build + runtime — required (matches server/Dockerfile runtime stage)
+ca-certificates
+libssl3                       # (Fedora: openssl-libs)  — runtime for reqwest/TLS
+libc6                         # (Fedora: glibc)          — implicit, declared for completeness
+
+# Dev toolchain (only needed if rebuilding Rust binary from source)
+optional:build-essential      # (Fedora: gcc gcc-c++ make)
+optional:pkg-config           # (Fedora: pkgconf-pkg-config)
+optional:libssl-dev           # (Fedora: openssl-devel)   — builder stage needs this
+
+# CLI utilities — required
+curl
+jq
+git
+tar
+xz-utils                      # (Fedora: xz)
+
+# Python runtime — required for dashboards + setup scripts
+python3                       # ≥ 3.11
+python3-pip
+python3-venv
+optional:python3-dev          # (Fedora: python3-devel)   — for pip-built C exts
+
+# Container runtime — required for docker compose stack bring-up
+optional:docker.io            # (Fedora: docker-ce)       — install via Docker's official repo for latest
+optional:docker-compose-plugin
+
+# Optional — dashboards
+optional:nodejs               # Node 20+ for obsidian-plugin tooling (ship via NodeSource repo)

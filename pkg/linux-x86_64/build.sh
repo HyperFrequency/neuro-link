@@ -5,9 +5,10 @@
 #   $PROOF_DIR/linux-x86_64.ready.json   (state:"ready" with sha256, smoke, target_arch)
 #
 # Uses `docker buildx` (linux/amd64) to cross-compile the Rust binary via the
-# existing server/Dockerfile (2-stage rust:1.82-slim → debian:bookworm-slim),
-# extracts /usr/local/bin/neuro-link, and emits a container-agnostic tarball.
-# Smoke-tests the extracted binary inside debian:bookworm-slim (linux/amd64).
+# existing server/Dockerfile (2-stage rust:1.90-slim-bookworm → debian:bookworm-slim
+# with matching glibc 2.36 + openssl/libssl3), extracts /usr/local/bin/neuro-link,
+# and emits a container-agnostic tarball. Smokes inside debian:bookworm-slim on
+# linux/amd64 with libssl3 + ca-certificates installed inline.
 
 set -euo pipefail
 

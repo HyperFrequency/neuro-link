@@ -1,0 +1,28 @@
+# pkg/linux-aarch64/system-deps.txt — Ubuntu/Debian 12+ aarch64 system dependencies
+# Install via: sudo apt-get install -y <each non-comment line>
+# Same set as linux-x86_64 (debian packages are arch-independent at the name level);
+# the underlying .deb will auto-select arm64 variant.
+
+ca-certificates
+libssl3
+libc6
+
+optional:build-essential
+optional:pkg-config
+optional:libssl-dev
+
+curl
+jq
+git
+tar
+xz-utils
+
+python3
+python3-pip
+python3-venv
+optional:python3-dev
+
+optional:docker.io
+optional:docker-compose-plugin
+
+optional:nodejs
