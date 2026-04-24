@@ -256,21 +256,14 @@ pub async fn search_wiki(
     let embedding_model = std::env::var("EMBEDDING_MODEL")
         .unwrap_or_else(|_| "Octen/Octen-Embedding-8B".into());
 
-    let embed_resp = client
-        .post(&embedding_url)
-        .json(&serde_json::json!({
-            "model": embedding_model,
-            "input": query
-        }))
-        .send()
+    // R+4 P-R4-A — route through the shared query-embed LRU cache in rag.rs.
+    // Returns Arc<Vec<f32>> so a repeat-query hit is a refcount bump, not a
+    // ~16KB memcpy. f32 → qdrant-compatible; the previous f64 filter_map was
+    // a lossy no-op (the server already emits f32-precision floats).
+    let vector_arc = crate::rag::cached_embed(&client, query, &embedding_url, &embedding_model)
         .await
         .context("Failed to get query embedding")?;
-
-    let embed_body: serde_json::Value = embed_resp.json().await?;
-    let vector: Vec<f64> = embed_body["data"][0]["embedding"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
-        .unwrap_or_default();
+    let vector: &[f32] = vector_arc.as_slice();
 
     if vector.is_empty() {
         anyhow::bail!("Empty embedding vector");
