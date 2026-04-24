@@ -122,6 +122,42 @@ def check_multilspy() -> dict[str, Any]:
     return _fail("multilspy", f"import failed exit {rc}: {out[:200]}")
 
 
+def _validate_mcp_entry(entry: dict[str, Any]) -> str | None:
+    """Mirror of install-mirror.sh's is_mcp_entry_valid. Returns None on
+    success, or a short reason string on failure. Transport inferred:
+    explicit .type wins, else string .url implies http, else stdio."""
+    if not isinstance(entry, dict):
+        return "entry is not a JSON object"
+    transport = entry.get("type")
+    if not isinstance(transport, str):
+        transport = "http" if isinstance(entry.get("url"), str) else "stdio"
+    if transport == "stdio":
+        cmd = entry.get("command")
+        if not isinstance(cmd, str) or not cmd:
+            return "stdio entry missing non-empty .command"
+        # Expand $HOME / ${HOME} / leading ~ for the executable probe
+        expanded = cmd.replace("${HOME}", str(HOME)).replace("$HOME", str(HOME))
+        if expanded.startswith("~"):
+            expanded = str(HOME) + expanded[1:]
+        if expanded.startswith("/"):
+            if not Path(expanded).exists():
+                return f"stdio .command {expanded} does not exist"
+            if not os.access(expanded, os.X_OK):
+                return f"stdio .command {expanded} not executable"
+        else:
+            if not shutil.which(expanded):
+                return f"stdio .command {cmd!r} not on PATH"
+        return None
+    if transport in ("http", "sse"):
+        url = entry.get("url")
+        if not isinstance(url, str) or not url:
+            return "http/sse entry missing non-empty .url"
+        if not url.startswith(("http://", "https://")):
+            return f"http/sse .url {url!r} does not start with http(s)://"
+        return None
+    return f"unknown transport type: {transport!r}"
+
+
 def check_mcp_servers() -> dict[str, Any]:
     if "mcp-servers" in SKIP:
         return _skipped("mcp-servers", "NLR_VERIFY_SKIP")
@@ -134,12 +170,33 @@ def check_mcp_servers() -> dict[str, Any]:
         return _fail("mcp-servers", f"invalid JSON: {e}")
     servers = data.get("mcpServers", {}) or {}
     missing_required = [s for s in REQUIRED_MCP_SERVERS if s not in servers]
-    missing_optional = [s for s in OPTIONAL_MCP_SERVERS if s not in servers]
     if missing_required:
         return _fail("mcp-servers", f"missing required: {','.join(missing_required)}")
-    note = f"required registered: {','.join(sorted(s for s in servers if s in REQUIRED_MCP_SERVERS))}"
+    # Gate-12 EE2: structural + operational validation for REQUIRED
+    # entries matches install-mirror.sh's is_mcp_entry_valid. Without
+    # this, verify.py greenlit stale broken registrations (empty
+    # .command, dangling executable path, malformed URL) that the
+    # installer would have rejected. OPTIONAL entries get the same
+    # check for reporting, but only contribute a warning.
+    malformed_required: list[str] = []
+    for srv in REQUIRED_MCP_SERVERS:
+        reason = _validate_mcp_entry(servers[srv])
+        if reason is not None:
+            malformed_required.append(f"{srv}({reason})")
+    if malformed_required:
+        return _fail("mcp-servers", f"required registered but invalid: {'; '.join(malformed_required)}")
+    missing_optional = [s for s in OPTIONAL_MCP_SERVERS if s not in servers]
+    malformed_optional: list[str] = []
+    for srv in OPTIONAL_MCP_SERVERS:
+        if srv in servers:
+            reason = _validate_mcp_entry(servers[srv])
+            if reason is not None:
+                malformed_optional.append(f"{srv}({reason})")
+    note = f"required OK: {','.join(sorted(s for s in servers if s in REQUIRED_MCP_SERVERS))}"
     if missing_optional:
         note += f"; optional absent: {','.join(missing_optional)}"
+    if malformed_optional:
+        note += f"; optional malformed: {','.join(malformed_optional)}"
     return _pass("mcp-servers", note)
 
 

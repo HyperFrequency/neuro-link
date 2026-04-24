@@ -280,6 +280,31 @@ else
   run cp "$TMP_RENDERED" "$SETTINGS"
 fi
 
+# Gate-12 EE1: prior CC2 filter only scrubbed the rendered template
+# before merge. Stale serena-hooks commands that were injected by an
+# earlier install (and survived in ~/.claude/settings.json) would
+# pass through the merge because concat+dedupe-by-.command keeps any
+# existing matching entry. Re-apply the strip to the merged result
+# when the serena-hooks binary is absent so retries actively purge
+# the dangling commands from the live config, not just from the
+# template input.
+if [[ ! -x "$HOME/.local/bin/serena-hooks" && -f "$SETTINGS" ]]; then
+  if grep -q 'serena-hooks' "$SETTINGS"; then
+    log "  purging stale serena-hooks commands from $SETTINGS (binary absent on this host)"
+    POST_STRIP=$(mktemp -t nlr-mirror-post-strip.XXXXXX.json)
+    jq '.hooks |= (
+          with_entries(
+            .value |= (
+              map(.hooks |= map(select(.command | test("serena-hooks") | not)))
+              | map(select((.hooks // []) | length > 0))
+            )
+          )
+          | with_entries(select(.value | length > 0))
+        )' "$SETTINGS" > "$POST_STRIP" \
+      && run mv "$POST_STRIP" "$SETTINGS"
+  fi
+fi
+
 # --- 4. Register MCP servers ---
 log "Registering MCP servers via install_mcp_servers.sh"
 MCP_INSTALLER="$REPO_ROOT/.claude/skills/neuro-link-setup/scripts/install_mcp_servers.sh"
