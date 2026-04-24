@@ -100,12 +100,25 @@ fn embed_cache_disabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Cache key = `sha256(model || \0 || query)` hex, prefixed by model to keep
-/// different-dim embedders from colliding.
-fn embed_cache_key(model: &str, query: &str) -> String {
+/// Cache key = `sha256(embedding_url || \0 || model || \0 || query)` hex.
+///
+/// **Gate #1 HIGH fix**: the prior key only hashed (model, query), so a
+/// rollover that kept the model name stable but swapped the backend URL
+/// (or pointed the same URL at a new model fingerprint) could serve stale
+/// or dim-incompatible vectors for up to 1h TTL — a live dimension mismatch
+/// against qdrant would manifest as hard errors deep in the search path.
+///
+/// Including the URL in the key namespaces the cache by backend identity
+/// so an ops-time rollover invalidates cleanly. A full model-fingerprint
+/// would be stronger still (e.g., pin the /v1/models response hash), but
+/// URL is a cheap robustness win that covers the common swap pattern
+/// (change `EMBEDDING_API_URL` to new host) with no extra I/O.
+fn embed_cache_key(embedding_url: &str, model: &str, query: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(embedding_url.as_bytes());
+    hasher.update([0u8]);
     hasher.update(model.as_bytes());
-    hasher.update([0u8]); // separator — prevents length-extension collisions
+    hasher.update([0u8]);
     hasher.update(query.as_bytes());
     hex::encode(hasher.finalize())
 }
@@ -157,10 +170,11 @@ pub(crate) async fn cached_embed(
     }
 
     let cache = embed_cache();
-    let key = embed_cache_key(embedding_model, query);
+    let key = embed_cache_key(embedding_url, embedding_model, query);
     let key_prefix: String = key.chars().take(8).collect();
     let query_len = query.chars().count();
 
+    // Fast-path: already cached?
     if let Some(hit) = cache.get(&key).await {
         tracing::debug!(
             "embed cache: hit=true key={} query_len={}",
@@ -170,15 +184,36 @@ pub(crate) async fn cached_embed(
         return Ok(hit);
     }
 
-    let vec = fetch_embedding_uncached(http, query, embedding_url, embedding_model).await?;
-    let arc = Arc::new(vec);
-    cache.insert(key, arc.clone()).await;
+    // **Gate #1 MED fix**: single-flight via `moka::future::Cache::try_get_with`.
+    // Previously the miss path was `get` → HTTP → `insert`, which let N concurrent
+    // callers with the same key each hit the embedder (3.4s per call under R+3
+    // numbers). `try_get_with` coalesces: the first caller's init future runs;
+    // every concurrent caller on the same key awaits the same result. This is
+    // moka's documented pattern for thundering-herd protection.
+    //
+    // The closure must be `Send` + `'static` for moka to hold it across awaits,
+    // so we clone the bits it needs.
+    let http_c = http.clone();
+    let url_c = embedding_url.to_string();
+    let model_c = embedding_model.to_string();
+    let query_c = query.to_string();
+    // moka wraps the init closure's error type in Arc<...>, so using
+    // anyhow::Error directly here means the map_err below sees
+    // Arc<anyhow::Error>. Clean + matches moka's documented pattern.
+    let result = cache
+        .try_get_with(key.clone(), async move {
+            let vec = fetch_embedding_uncached(&http_c, &query_c, &url_c, &model_c).await?;
+            Ok::<_, anyhow::Error>(Arc::new(vec))
+        })
+        .await
+        .map_err(|e: std::sync::Arc<anyhow::Error>| anyhow!("cached_embed init failed: {}", e))?;
+
     tracing::debug!(
         "embed cache: hit=false key={} query_len={}",
         key_prefix,
         query_len
     );
-    Ok(arc)
+    Ok(result)
 }
 
 /// Test-only access to the default cache — lets tests assert eviction /
@@ -684,7 +719,8 @@ mod tests {
         call_count.fetch_add(1, Ordering::SeqCst);
         // Tiny "embedding": [len(query), len(model), query_hash_byte_0, ...].
         // Deterministic per (model, query), distinct across pairs.
-        let bytes = embed_cache_key(model, query);
+        // Gate #1 HIGH fix added embedding_url to the key; tests use a stable URL.
+        let bytes = embed_cache_key("http://test.local/v1/embeddings", model, query);
         let first_byte = u8::from_str_radix(&bytes[0..2], 16).unwrap_or(0);
         Arc::new(vec![
             query.len() as f32,
@@ -707,7 +743,7 @@ mod tests {
         if disabled {
             return mock_fetch(model, query, call_count).await;
         }
-        let key = embed_cache_key(model, query);
+        let key = embed_cache_key("http://test.local/v1/embeddings", model, query);
         if let Some(hit) = cache.get(&key).await {
             return hit;
         }
@@ -837,9 +873,16 @@ mod tests {
         // Direct hash-key test: the model prefix + NUL separator must
         // produce distinct keys for (m1, "ab") vs (m1 + "a", "b"), which
         // would otherwise collide on a naive `model + query` concatenation.
-        let k1 = embed_cache_key("abc", "def");
-        let k2 = embed_cache_key("abcd", "ef");
+        let url = "http://test.local/v1/embeddings";
+        let k1 = embed_cache_key(url, "abc", "def");
+        let k2 = embed_cache_key(url, "abcd", "ef");
         assert_ne!(k1, k2, "NUL separator must prevent length-extension collisions");
+
+        // Gate #1 HIGH fix: different URLs under the SAME model must also
+        // namespace apart — prevents stale-vector-after-backend-swap.
+        let k3 = embed_cache_key("http://host-a/v1/embeddings", "abc", "def");
+        let k4 = embed_cache_key("http://host-b/v1/embeddings", "abc", "def");
+        assert_ne!(k3, k4, "embedding_url must namespace the cache");
     }
 
     #[tokio::test]
@@ -848,7 +891,7 @@ mod tests {
         // without panic and accepts writes/reads. This catches regressions
         // where someone changes `EMBED_CACHE` init order.
         let cache = default_cache_for_tests();
-        let key = embed_cache_key("smoke", "test");
+        let key = embed_cache_key("http://test.local/v1/embeddings", "smoke", "test");
         cache.insert(key.clone(), Arc::new(vec![1.0_f32, 2.0, 3.0])).await;
         let got = cache.get(&key).await.expect("default cache lost our write");
         assert_eq!(&*got, &vec![1.0_f32, 2.0, 3.0]);
