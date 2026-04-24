@@ -116,9 +116,20 @@ classify_mcp() {
   if is_mcp_entry_valid "$srv"; then echo "valid"; else echo "malformed"; fi
 }
 
-# Atomic pre-mutation guard: if any required entry is present but
-# invalid, bail out before any write touches the filesystem.
+# Atomic pre-mutation guard: if ~/.claude.json is unparseable OR any
+# required entry is present but invalid, bail out before any write
+# touches the filesystem. A broken file would otherwise trick
+# classify_mcp into reporting 'absent' (jq returns non-zero on parse
+# error, which our caller treats as missing key) and the script would
+# then run sections 1-3 before install_mcp_servers.sh finally hit the
+# invalid JSON.
 if [[ "$DRY_RUN" != "1" && -f "$CLAUDE_JSON" ]]; then
+  if ! jq empty "$CLAUDE_JSON" >/dev/null 2>&1; then
+    log "ERROR: $CLAUDE_JSON is not valid JSON."
+    log "  Exiting BEFORE any hook/settings/mcp mutation to preserve your Claude config."
+    log "  Back up the file (cp $CLAUDE_JSON $CLAUDE_JSON.broken) then fix or reset it and re-run."
+    exit 3
+  fi
   PREMUT_MALFORMED=()
   for srv in "${REQUIRED_MCP[@]}"; do
     [[ "$(classify_mcp "$srv")" == "malformed" ]] && PREMUT_MALFORMED+=("$srv")

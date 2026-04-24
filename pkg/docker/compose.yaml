@@ -20,6 +20,10 @@ services:
       retries: 10
       start_period: 30s
 
+  # Gate-9 Y2: moved to `full` profile so `docker compose` (default) and
+  # `--profile rag` don't require NEO4J_PASSWORD at parse time — lets
+  # the minimum RAG setup boot from a clean clone without any secrets.
+  # Graph-ontology workloads opt in via `--profile full`.
   neo4j:
     image: neo4j:5.23-community
     ports: ["7474:7474", "7687:7687"]
@@ -33,7 +37,11 @@ services:
       timeout: 10s
       retries: 10
       start_period: 45s
+    profiles: ["full"]
 
+  # Gate-9 Y2: moved to `full` profile — same reasoning as neo4j. The RAG
+  # retrieval path doesn't invoke the LiteLLM proxy; only the full
+  # deployment does.
   litellm-proxy:
     build: { context: ../.., dockerfile: pkg/docker/Dockerfile.litellm }
     ports: ["4000:4000"]
@@ -43,6 +51,7 @@ services:
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
     depends_on: { qdrant: { condition: service_healthy } }
+    profiles: ["full"]
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:4000/health || exit 1"]
       interval: 10s
