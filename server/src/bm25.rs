@@ -33,13 +33,24 @@ fn tokenize(text: &str) -> Vec<String> {
 }
 
 pub fn build_index(root: &Path) -> BM25Index {
-    let kb = root.join("02-KB-main");
+    // Gate-40 FFF3: walk the SAME vault roots embed_wiki uses
+    // (vaults/ canonical, 02-KB-main/ legacy). Earlier this only
+    // walked 02-KB-main/, so on a vault-migrated repo BM25 lost
+    // the keyword side and the RRF merge couldn't correlate
+    // vector hits with keyword hits for vaults/-resident docs.
+    // Dedupe by rel: vaults/ wins per migration policy.
     let skip = ["schema.md", "index.md", "log.md"];
     let mut docs = HashMap::new();
     let mut postings: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     let mut total_tokens: usize = 0;
     let mut doc_id: usize = 0;
+    let mut seen_rels: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    for vault_name in crate::embed::DEFAULT_VAULT_DIRS {
+        let kb = root.join(vault_name);
+        if !kb.is_dir() {
+            continue;
+        }
     for entry in WalkDir::new(&kb).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if !path.extension().is_some_and(|e| e == "md")
@@ -48,8 +59,11 @@ pub fn build_index(root: &Path) -> BM25Index {
             continue;
         }
 
-        let content = fs::read_to_string(path).unwrap_or_default();
         let rel = path.strip_prefix(&kb).unwrap_or(path).display().to_string();
+        if !seen_rels.insert(rel.clone()) {
+            continue;  // already indexed from earlier (higher-priority) vault
+        }
+        let content = fs::read_to_string(path).unwrap_or_default();
         let preview: String = content
             .lines()
             .filter(|l| !l.starts_with("---") && !l.starts_with('#') && !l.is_empty())
@@ -77,6 +91,7 @@ pub fn build_index(root: &Path) -> BM25Index {
         );
         doc_id += 1;
     }
+    } // for vault_name
 
     let doc_count = docs.len();
     let avg_doc_len = if doc_count > 0 {

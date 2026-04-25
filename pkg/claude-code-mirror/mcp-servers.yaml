@@ -15,6 +15,11 @@ required:
     args: ["mcp"]
     env:
       NLR_ROOT: "${NLR_ROOT}"
+      # Gate-40 FFF1: forward NLR_WORKSPACE_ID so the documented escape
+      # hatch (for FAT/exFAT/SMB/FUSE filesystems where hard_link is
+      # unsupported) actually reaches the MCP server process. Empty
+      # string is harmless; set value wins per resolve_workspace_id.
+      NLR_WORKSPACE_ID: "${NLR_WORKSPACE_ID:-}"
     notes: |
       Canonical internal write path for 02-KB-main/ via nlr_wiki_* tools.
       Also exposes nlr_harness_*, nlr_rag_*, nlr_ontology_*, nlr_sessions_*,

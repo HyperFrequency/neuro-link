@@ -186,32 +186,51 @@ fn handle_tools_call(
 }
 
 fn handle_resources_list(id: Option<Value>, root: &std::path::Path) -> JsonRpcResponse {
-    let kb = root.join("02-KB-main");
+    // Gate-40 FFF2: walk the same vault roots embed_wiki uses
+    // (vaults/ canonical, 02-KB-main/ legacy). Earlier this function
+    // only walked 02-KB-main/, so any retrieval hit emitted from
+    // vaults/ was unresolvable via resources/read. Dedupe by relative
+    // path, vaults/ wins (matches embed_wiki's first-root-wins).
     let skip = ["schema.md", "index.md", "log.md"];
     let mut resources = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(&kb) {
-        fn walk(dir: &std::path::Path, kb: &std::path::Path, skip: &[&str], out: &mut Vec<Value>) {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        walk(&path, kb, skip, out);
-                    } else if path.extension().is_some_and(|e| e == "md")
-                        && !skip.iter().any(|s| path.file_name().is_some_and(|f| f == *s))
-                    {
-                        let rel = path.strip_prefix(kb).unwrap_or(&path).display().to_string();
-                        out.push(serde_json::json!({
-                            "uri": format!("nlr://wiki/{rel}"),
-                            "name": rel,
-                            "mimeType": "text/markdown"
-                        }));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn walk(
+        dir: &std::path::Path,
+        vault_root: &std::path::Path,
+        skip: &[&str],
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<Value>,
+    ) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, vault_root, skip, seen, out);
+                } else if path.extension().is_some_and(|e| e == "md")
+                    && !skip.iter().any(|s| path.file_name().is_some_and(|f| f == *s))
+                {
+                    let rel = path
+                        .strip_prefix(vault_root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    if !seen.insert(rel.clone()) {
+                        continue; // already listed from a higher-priority vault
                     }
+                    out.push(serde_json::json!({
+                        "uri": format!("nlr://wiki/{rel}"),
+                        "name": rel,
+                        "mimeType": "text/markdown"
+                    }));
                 }
             }
         }
-        let _ = entries; // consumed by walk
-        walk(&kb, &kb, &skip, &mut resources);
+    }
+    for vault_name in crate::embed::DEFAULT_VAULT_DIRS {
+        let vault_root = root.join(vault_name);
+        if vault_root.is_dir() {
+            walk(&vault_root, &vault_root, &skip, &mut seen, &mut resources);
+        }
     }
 
     JsonRpcResponse::success(id, serde_json::json!({ "resources": resources }))
@@ -236,16 +255,29 @@ fn handle_resources_read(
         return JsonRpcResponse::error(id, -32602, "Invalid path: traversal not allowed".into());
     }
 
-    let kb_root = root.join("02-KB-main");
-    let full_path = kb_root.join(rel_path);
-
-    // Canonicalize and verify resolved path is under kb_root
-    let canonical = match full_path.canonicalize() {
-        Ok(p) => p,
-        Err(e) => return JsonRpcResponse::error(id, -32602, format!("Resource not found: {e}")),
+    // Gate-40 FFF2: try each vault root in priority order. embed_wiki
+    // emits payload.path relative to whichever root holds the file
+    // (vaults/ wins over 02-KB-main/), so the resource read must
+    // attempt every vault root the indexer walks.
+    let mut canonical: Option<std::path::PathBuf> = None;
+    let mut allowed_canonical: Option<std::path::PathBuf> = None;
+    for vault_name in crate::embed::DEFAULT_VAULT_DIRS {
+        let vault_root = root.join(vault_name);
+        let candidate = vault_root.join(rel_path);
+        if let Ok(c) = candidate.canonicalize() {
+            let vault_canonical = vault_root.canonicalize().unwrap_or(vault_root);
+            if c.starts_with(&vault_canonical) {
+                canonical = Some(c);
+                allowed_canonical = Some(vault_canonical);
+                break;
+            }
+        }
+    }
+    let canonical = match canonical {
+        Some(c) => c,
+        None => return JsonRpcResponse::error(id, -32602, format!("Resource not found in any vault root: {rel_path}")),
     };
-    let kb_canonical = kb_root.canonicalize().unwrap_or(kb_root);
-    if !canonical.starts_with(&kb_canonical) {
+    if !canonical.starts_with(&allowed_canonical.unwrap()) {
         return JsonRpcResponse::error(id, -32602, "Access denied: path outside knowledge base".into());
     }
 
