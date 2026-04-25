@@ -32,7 +32,8 @@ cat > /tmp/nlr-mcp-patch.json <<JSON
       "command": "$NLR_BIN",
       "args": ["mcp"],
       "env": {
-        "NLR_ROOT": "$REPO_ROOT"
+        "NLR_ROOT": "$REPO_ROOT",
+        "NLR_WORKSPACE_ID": "${NLR_WORKSPACE_ID:-}"
       }
     },
     "neuro-link-http": {

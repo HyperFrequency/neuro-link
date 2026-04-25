@@ -60,10 +60,18 @@ pub fn build_index(root: &Path) -> BM25Index {
         }
 
         let rel = path.strip_prefix(&kb).unwrap_or(path).display().to_string();
-        if !seen_rels.insert(rel.clone()) {
+        if seen_rels.contains(&rel) {
             continue;  // already indexed from earlier (higher-priority) vault
         }
-        let content = fs::read_to_string(path).unwrap_or_default();
+        // Gate-41 GGG2: dedupe only AFTER reading non-empty content.
+        // Prior `seen_rels.insert(rel)` before the read meant a
+        // corrupt/unreadable vaults/foo.md silently shadowed a healthy
+        // 02-KB-main/foo.md fallback (read returned default = empty
+        // string, but the rel was already locked).
+        let content = match fs::read_to_string(path) {
+            Ok(c) if !c.is_empty() => c,
+            _ => continue,
+        };
         let preview: String = content
             .lines()
             .filter(|l| !l.starts_with("---") && !l.starts_with('#') && !l.is_empty())
@@ -85,6 +93,8 @@ pub fn build_index(root: &Path) -> BM25Index {
             postings.entry(term).or_default().push((doc_id, freq));
         }
 
+        // Gate-41 GGG2: mark rel as seen only after successful index.
+        seen_rels.insert(rel.clone());
         docs.insert(
             doc_id,
             (rel, preview[..preview.len().min(300)].to_string(), token_count),
