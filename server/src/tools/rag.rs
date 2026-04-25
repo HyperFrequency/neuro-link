@@ -39,13 +39,31 @@ pub fn call(name: &str, args: &Value, root: &Path) -> Result<String> {
             let qdrant_url = std::env::var("QDRANT_URL")
                 .unwrap_or_else(|_| "http://localhost:6333".into());
 
-            let vector_results = tokio::task::block_in_place(|| {
+            // Gate-35 AAA1: surface workspace-resolution failures from
+            // search_wiki instead of swallowing every error and silently
+            // degrading to BM25-only. A missing NLR_WORKSPACE_ID +
+            // missing <NLR_ROOT>/.nlr-workspace-id should be an explicit
+            // error so the caller knows tenant isolation isn't satisfied
+            // and not a phantom "no results" condition. Other errors
+            // (Qdrant down, network) still degrade gracefully — this is
+            // a configuration error, not an outage.
+            let search_outcome = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     embed::search_wiki(&query, &qdrant_url, limit * 2).await
                 })
-            })
-            .ok()
-            .unwrap_or_default();
+            });
+            let vector_results = match search_outcome {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("no workspace_id resolvable") {
+                        return Err(anyhow::anyhow!(
+                            "nlr_rag_query: workspace isolation not configured: {msg}"
+                        ));
+                    }
+                    Vec::new()
+                }
+            };
 
             // R+3: opt-in rerank pass via warm Qwen3-Reranker (llama-server :8401).
             // Enabled when NLR_RAG_RERANK_URL is set (typical value

@@ -21,12 +21,15 @@ pub const DEFAULT_VAULT_DIRS: &[&str] = &["vaults", "02-KB-main"];
 /// Return a stable workspace identifier. Resolution order:
 ///   1. NLR_WORKSPACE_ID env (wins; no fs side effects)
 ///   2. Cached `<root>/.nlr-workspace-id` file
-///   3. Fresh UUIDv4 persisted to that file
+///   3. Fresh UUIDv4 persisted via O_CREAT|O_EXCL to that file
 ///
-/// Gate-34 ZZ2: returns Result so persistence failures (read-only
-/// checkout, permissions, full disk) propagate instead of silently
-/// minting a new UUID per run that breaks idempotency. Callers MUST
-/// either set NLR_WORKSPACE_ID explicitly or accept the fail.
+/// Gate-34 ZZ2 + Gate-35 AAA2: returns Result so persistence failures
+/// propagate; creation is ATOMIC via OpenOptions::create_new. Two
+/// concurrent first-run callers race to create the file — one wins,
+/// the other observes AlreadyExists and re-reads to converge on the
+/// winning ID. Without this, racing embed_wiki calls could mint
+/// distinct UUIDs and split one workspace across two Qdrant
+/// namespaces.
 pub fn resolve_workspace_id(root: &Path) -> Result<String> {
     if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
         if !env_id.trim().is_empty() {
@@ -34,20 +37,52 @@ pub fn resolve_workspace_id(root: &Path) -> Result<String> {
         }
     }
     let cache = root.join(".nlr-workspace-id");
+    // Fast path: file already persisted, just read it.
     if let Ok(persisted) = fs::read_to_string(&cache) {
         let trimmed = persisted.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
         }
     }
+    // Slow path: try to atomically create the file with our UUID.
+    // If another process won the race, AlreadyExists tells us to
+    // re-read the file and use whatever they wrote.
+    use std::io::Write;
     let new_id = uuid::Uuid::new_v4().to_string();
-    fs::write(&cache, format!("{new_id}\n")).with_context(|| {
-        format!(
-            "failed to persist workspace id to {} — set NLR_WORKSPACE_ID explicitly or fix the path's writability",
+    let line = format!("{new_id}\n");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&cache)
+    {
+        Ok(mut f) => {
+            f.write_all(line.as_bytes()).with_context(|| {
+                format!(
+                    "failed to write new workspace id to {} — set NLR_WORKSPACE_ID explicitly",
+                    cache.display()
+                )
+            })?;
+            Ok(new_id)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another concurrent caller won the race — read its UUID.
+            let persisted = fs::read_to_string(&cache).with_context(|| {
+                format!("workspace id file {} appeared but is unreadable", cache.display())
+            })?;
+            let trimmed = persisted.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "workspace id file {} exists but is empty (concurrent create raced)",
+                    cache.display()
+                );
+            }
+            Ok(trimmed.to_string())
+        }
+        Err(e) => Err(anyhow::Error::from(e).context(format!(
+            "failed to create workspace id file at {} — set NLR_WORKSPACE_ID explicitly or fix path writability",
             cache.display()
-        )
-    })?;
-    Ok(new_id)
+        ))),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
