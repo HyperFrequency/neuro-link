@@ -94,64 +94,12 @@ pub fn allowed_paths(root: &Path) -> Vec<String> {
             return Vec::new();
         }
     };
-    // Strip BOM and normalize CRLF for the rest of the parser.
-    let normalized = content
-        .strip_prefix('\u{FEFF}')
-        .unwrap_or(&content)
-        .replace("\r\n", "\n");
-    let frontmatter: Option<&str> = (|| -> Option<&str> {
-        // Skip leading blank lines and `#` comments before the opening
-        // delimiter. Find the first non-blank/non-comment line; it must
-        // be exactly `---` (with trailing whitespace allowed).
-        let mut idx = 0usize;
-        for line in normalized.split_inclusive('\n') {
-            let trimmed = line.trim_end_matches('\n').trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                idx += line.len();
-                continue;
-            }
-            if trimmed != "---" {
-                return None;
-            }
-            idx += line.len();
-            break;
-        }
-        let body = normalized.get(idx..)?;
-        // Gate-57 WWW1 + Gate-58 XXX1: closing delimiter must be `---`
-        // at COLUMN 0 (no leading whitespace) — only trailing
-        // whitespace is tolerated. Prior trim()-both-sides rule
-        // accepted indented `  ---` inside YAML block scalars,
-        // truncating frontmatter prematurely and dropping
-        // allowed_paths back to DEFAULT.
-        let mut cursor = 0usize;
-        let mut end_marker_pos: Option<usize> = None;
-        for line in body.split_inclusive('\n') {
-            let no_nl = line.trim_end_matches('\n');
-            // Reject leading whitespace; allow trailing.
-            if no_nl.starts_with(|c: char| c.is_whitespace()) {
-                cursor += line.len();
-                continue;
-            }
-            if no_nl.trim_end() == "---" {
-                end_marker_pos = Some(cursor);
-                break;
-            }
-            cursor += line.len();
-        }
-        // Allow file ending with a `---` that has no trailing newline.
-        if end_marker_pos.is_none() {
-            let last_newline = body.rfind('\n').map(|n| n + 1).unwrap_or(0);
-            let last_line = &body[last_newline..];
-            if !last_line.starts_with(|c: char| c.is_whitespace())
-                && last_line.trim_end() == "---"
-            {
-                end_marker_pos = Some(last_newline);
-            }
-        }
-        let end_marker_pos = end_marker_pos?;
-        Some(&body[..end_marker_pos])
-    })();
-    let yaml_text = match frontmatter {
+    // Gate-59 YYY1: route through the shared extract_frontmatter()
+    // helper. Both this function and parse_frontmatter() now share
+    // the same opener/closer rules — config validity is consistent
+    // across access control and CLI/admin tooling.
+    let yaml_text_owned = extract_frontmatter(&content);
+    let yaml_text = match yaml_text_owned.as_deref() {
         Some(f) => f,
         None => {
             // File exists but no parseable frontmatter. Codex gate-54
@@ -331,11 +279,64 @@ pub fn diagnose_nlr_root() -> NlrRootDiag {
     analyze_nlr_root(&env, &file, |p| p.is_dir())
 }
 
+/// Shared frontmatter extractor. Returns the YAML body between the
+/// opening and closing `---` delimiters (both at column 0, trim_end
+/// tolerated). Handles UTF-8 BOM, CRLF, leading blank lines and
+/// `#` comments before the opener, indented `---` inside YAML
+/// content (does NOT terminate frontmatter), and EOF without a
+/// trailing newline. Gate-59 YYY1: this is the SINGLE source of
+/// truth — both allowed_paths() and parse_frontmatter() now route
+/// through it so the same file produces consistent verdicts in
+/// access-control + admin tooling.
+pub fn extract_frontmatter(raw: &str) -> Option<String> {
+    let normalized = raw.strip_prefix('\u{FEFF}').unwrap_or(raw).replace("\r\n", "\n");
+    let mut idx = 0usize;
+    for line in normalized.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches('\n').trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            idx += line.len();
+            continue;
+        }
+        if trimmed != "---" {
+            return None;
+        }
+        idx += line.len();
+        break;
+    }
+    let body = normalized.get(idx..)?;
+    let mut cursor = 0usize;
+    let mut end_marker_pos: Option<usize> = None;
+    for line in body.split_inclusive('\n') {
+        let no_nl = line.trim_end_matches('\n');
+        if no_nl.starts_with(|c: char| c.is_whitespace()) {
+            cursor += line.len();
+            continue;
+        }
+        if no_nl.trim_end() == "---" {
+            end_marker_pos = Some(cursor);
+            break;
+        }
+        cursor += line.len();
+    }
+    if end_marker_pos.is_none() {
+        let last_newline = body.rfind('\n').map(|n| n + 1).unwrap_or(0);
+        let last_line = &body[last_newline..];
+        if !last_line.starts_with(|c: char| c.is_whitespace())
+            && last_line.trim_end() == "---"
+        {
+            end_marker_pos = Some(last_newline);
+        }
+    }
+    Some(body[..end_marker_pos?].to_string())
+}
+
+
 pub fn parse_frontmatter(path: &Path) -> Result<HashMap<String, String>> {
+    // Gate-59 YYY1: route through the shared extractor instead of a
+    // separate regex. Both access-control and admin/CLI now agree on
+    // what counts as "valid frontmatter".
     let content = std::fs::read_to_string(path)?;
-    let re = Regex::new(r"(?s)^---\n(.+?)\n---")?;
-    let caps = re.captures(&content).context("No frontmatter found")?;
-    let yaml_str = &caps[1];
+    let yaml_str = extract_frontmatter(&content).context("No frontmatter found")?;
     let mut map = HashMap::new();
     for line in yaml_str.lines() {
         if let Some((key, val)) = line.split_once(':') {
