@@ -68,8 +68,11 @@ pub fn build_index(root: &Path) -> BM25Index {
         // corrupt/unreadable vaults/foo.md silently shadowed a healthy
         // 02-KB-main/foo.md fallback (read returned default = empty
         // string, but the rel was already locked).
+        // Gate-44 JJJ2: align with embed_wiki + nlr_rag_rebuild_index —
+        // treat whitespace-only as empty so a blank vaults/ file does
+        // not shadow a populated 02-KB-main/ fallback.
         let content = match fs::read_to_string(path) {
-            Ok(c) if !c.is_empty() => c,
+            Ok(c) if !c.trim().is_empty() => c,
             _ => continue,
         };
         let preview: String = content

@@ -19,7 +19,12 @@ pub fn resolve_nlr_root() -> Result<PathBuf> {
         }
     }
     let cwd = std::env::current_dir()?;
-    if cwd.join("CLAUDE.md").exists() && cwd.join("02-KB-main").is_dir() {
+    // Gate-44 JJJ3: accept either vault root (canonical vaults/ or
+    // legacy 02-KB-main/) so a vault-only fresh checkout can boot
+    // without requiring NLR_ROOT to be exported.
+    if cwd.join("CLAUDE.md").exists()
+        && (cwd.join("vaults").is_dir() || cwd.join("02-KB-main").is_dir())
+    {
         return Ok(cwd);
     }
     anyhow::bail!("Cannot resolve NLR_ROOT. Set NLR_ROOT env var or run scripts/init.sh.")
@@ -28,6 +33,9 @@ pub fn resolve_nlr_root() -> Result<PathBuf> {
 /// Default folders the MCP server exposes. Users can customize via config/neuro-link.md
 /// by setting `allowed_paths` in YAML frontmatter.
 const DEFAULT_ALLOWED_PATHS: &[&str] = &[
+    // Gate-44 JJJ3: vaults/ is the canonical knowledge root; allow it
+    // by default so vault-only installs don't need user config.
+    "vaults",
     "00-raw",
     "01-sorted",
     "02-KB-main",

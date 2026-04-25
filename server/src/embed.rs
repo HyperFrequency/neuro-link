@@ -357,13 +357,33 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
                 Ok(c) if !c.trim().is_empty() => c,
                 _ => {
                     // Tombstone the deterministic point for this rel.
+                    // Gate-44 JJJ1: surface delete failures via warn-log.
+                    // Fire-and-forget hid network/auth/4xx-5xx errors and
+                    // left previously-indexed-then-deleted content
+                    // searchable forever.
                     let stale_id = uuid::Uuid::new_v5(&workspace_ns, rel.as_bytes()).to_string();
                     let delete_url = format!("{qdrant_url}/collections/{collection}/points/delete");
-                    let _ = client
+                    match client
                         .post(&delete_url)
                         .json(&serde_json::json!({"points": [stale_id]}))
                         .send()
-                        .await;
+                        .await
+                    {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            if !status.is_success() {
+                                let body = resp.text().await.unwrap_or_default();
+                                tracing::warn!(
+                                    "Qdrant tombstone of stale point for {rel} failed: HTTP {status} from {delete_url}: {body}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Qdrant tombstone of stale point for {rel} (id={stale_id}) failed: {e}"
+                            );
+                        }
+                    }
                     continue;
                 }
             };
