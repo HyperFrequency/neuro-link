@@ -118,9 +118,15 @@ pub fn allowed_paths(root: &Path) -> Vec<String> {
 /// Check if a relative path (from NLR_ROOT) is within an allowed directory.
 pub fn is_path_allowed(root: &Path, rel_path: &str) -> bool {
     let allowed = allowed_paths(root);
-    // "all" or empty means everything
+    // Gate-53 SSS1: empty allowlist means DENY ALL, not allow-all.
+    // RRR1's parser intentionally returns empty for malformed/empty
+    // YAML sequences as a fail-closed signal — but is_path_allowed
+    // was still treating empty as allow-everything, defeating the
+    // safety property entirely. The explicit "all" case is now
+    // represented by allowed_paths returning DEFAULT_ALLOWED_PATHS
+    // (non-empty), so an empty Vec is unambiguously deny-all.
     if allowed.is_empty() {
-        return true;
+        return false;
     }
     // Gate-45 KKK2: match the FIRST PATH SEGMENT, not raw string
     // prefix. Prior `starts_with` let `vaults-private/...` or
