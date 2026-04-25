@@ -113,6 +113,15 @@ pub async fn handle_mcp(
                 let dir = root.join(dir_name);
                 if !dir.is_dir() { continue; }
                 let is_vault = vault_set.contains(dir_name.as_str());
+                // Gate-50 PPP1: skip symlinked vault roots — same
+                // reasoning as resources/read; a symlinked vaults/
+                // pointing at excluded 02-KB-main/ would otherwise
+                // enumerate excluded content under nlr://wiki/* URIs.
+                if is_vault {
+                    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+                        if meta.file_type().is_symlink() { continue; }
+                    }
+                }
                 for entry in WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if path.is_file()
@@ -214,17 +223,26 @@ pub async fn handle_mcp(
             };
             // Build (vault_root, candidate_path) pairs so the post-
             // canonicalize containment check (gate-49 OOO1) can verify
-            // each resolved path stays under its OWN vault root —
-            // catches symlink escapes from an allowed vault into an
-            // excluded one.
+            // each resolved path stays under its OWN vault root.
+            // Gate-50 PPP1: skip vault roots that are SYMLINKS — a
+            // `vaults/` entry symlinked to `02-KB-main/` would
+            // canonicalize to the excluded root and the per-vault
+            // containment check would still pass (both vault_canonical
+            // and canonical resolve to the same target).
             let candidate_pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = if let Some(vrel) = vault_rel {
                 vault_dirs
                     .iter()
                     .filter(|v| allowed_set.contains(*v))
-                    .map(|v| {
+                    .filter_map(|v| {
                         let vault_root = root.join(v);
-                        let candidate = vault_root.join(vrel);
-                        (vault_root, candidate)
+                        // Reject symlinked vault roots — fail-closed.
+                        match std::fs::symlink_metadata(&vault_root) {
+                            Ok(meta) if meta.file_type().is_symlink() => None,
+                            _ => {
+                                let candidate = vault_root.join(vrel);
+                                Some((vault_root, candidate))
+                            }
+                        }
                     })
                     .collect()
             } else {
