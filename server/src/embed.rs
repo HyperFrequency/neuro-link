@@ -18,10 +18,15 @@ use walkdir::WalkDir;
 /// This disambiguates the source of each indexed entry.
 pub const DEFAULT_VAULT_DIRS: &[&str] = &["vaults", "02-KB-main"];
 
-/// Process-global cache of the search-time workspace ID (gate-37 CCC2).
-/// First call to search_wiki resolves env / NLR_ROOT cache, subsequent
-/// calls reuse the same value to prevent mid-process tenant shift.
-static SEARCH_WORKSPACE_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+/// Process-global cache of the search-time workspace ID. Gate-38 DDD2:
+/// switched from OnceLock<Option<String>> to Mutex<Option<String>> so a
+/// first-call MISS doesn't poison the process forever — we cache only
+/// successful resolutions; misses leave the slot at None so a later
+/// call after `nlr_rag_embed` creates the cache file can resolve and
+/// populate. Once a Some lands, it stays for the process lifetime
+/// (preserves CCC2's "no mid-process tenant shift" property for the
+/// hot path while making first-miss recovery automatic).
+static SEARCH_WORKSPACE_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Return a stable workspace identifier. Resolution order:
 ///   1. NLR_WORKSPACE_ID env (wins; no fs side effects)
@@ -50,16 +55,15 @@ pub fn resolve_workspace_id(root: &Path) -> Result<String> {
         }
     }
     // Slow path: write the UUID to a uniquely-named temp file (PID +
-    // UUID-suffixed so concurrent processes don't collide), then
-    // atomically `hard_link` it into the cache path. Gate-37 CCC1:
-    // prior `create_new` on the cache path could leave an empty-file
-    // tombstone after a crashed write_all. Now writes are content-
-    // complete BEFORE they become visible at the cache path:
-    //   1. write UUID to temp + sync_all (durable on disk)
-    //   2. hard_link(temp, cache) — atomic; AlreadyExists if another
-    //      caller already linked their UUID
-    //   3. delete temp regardless (it has the same inode as cache or
-    //      is orphaned if we lost)
+    // UUID-suffixed so concurrent processes don't collide on the temp
+    // path), then `rename` it into the cache path. Gate-38 DDD1:
+    // hard_link is unsupported on FAT/exFAT/SMB/many FUSE mounts;
+    // rename is portable. Race semantics: rename overwrites silently,
+    // so the final cache content is whichever rename landed last —
+    // we then read-after-rename to discover the surviving UUID and
+    // converge on it. Gate-38 DDD3: parent-directory fsync after the
+    // rename + temp cleanup makes the new directory entry durable
+    // across power loss / host crash.
     use std::io::Write;
     let new_id = uuid::Uuid::new_v4().to_string();
     let line = format!("{new_id}\n");
@@ -83,37 +87,36 @@ pub fn resolve_workspace_id(root: &Path) -> Result<String> {
             )));
         }
     }
-    match std::fs::hard_link(&temp, &cache) {
-        Ok(()) => {
-            temp_cleanup();
-            Ok(new_id)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Another caller landed first. Their write was content-
-            // complete before they linked, so the file is guaranteed
-            // non-empty.
-            temp_cleanup();
-            let persisted = fs::read_to_string(&cache).with_context(|| {
-                format!("workspace id file {} exists but unreadable", cache.display())
-            })?;
-            let trimmed = persisted.trim();
-            if trimmed.is_empty() {
-                anyhow::bail!(
-                    "workspace id file {} exists but is empty — likely from a pre-Gate-37 install; \
-                     delete the empty file and re-run, or set NLR_WORKSPACE_ID explicitly",
-                    cache.display()
-                );
-            }
-            Ok(trimmed.to_string())
-        }
-        Err(e) => {
-            temp_cleanup();
-            Err(anyhow::Error::from(e).context(format!(
-                "failed to link workspace id into {}",
-                cache.display()
-            )))
+    fs::rename(&temp, &cache).with_context(|| {
+        format!(
+            "failed to publish workspace id from {} to {}",
+            temp.display(),
+            cache.display()
+        )
+    })?;
+    // Gate-38 DDD3: durably persist the directory entry. Best-effort
+    // on platforms where opening a directory for write isn't allowed
+    // (e.g. Windows) — file contents are already synced, so the
+    // window for losing the entry is small.
+    if let Some(parent) = cache.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
     }
+    // Read back to discover whose UUID won the rename race (rename
+    // overwrites silently; if two processes race, the second
+    // overwrites the first — both must converge on the surviving id).
+    let actual = fs::read_to_string(&cache).with_context(|| {
+        format!("workspace id file {} appeared but unreadable", cache.display())
+    })?;
+    let trimmed = actual.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(
+            "workspace id file {} is empty after publish — concurrent writer interrupted",
+            cache.display()
+        );
+    }
+    Ok(trimmed.to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -454,30 +457,41 @@ pub async fn search_wiki(
         "limit": limit,
         "with_payload": true
     });
-    // Gate-37 CCC2: resolve workspace_id ONCE per process. Prior
-    // code re-resolved on every query, so a mid-process change to
-    // NLR_ROOT or ~/.claude/state/nlr_root could shift the tenant
-    // filter while BM25/file access continued on the original repo.
-    // OnceLock<Option<String>> caches the first successful (or
-    // unsuccessful) resolution for the process lifetime; restart
-    // is required to pick up a new workspace.
-    let resolved_id = SEARCH_WORKSPACE_ID.get_or_init(|| {
-        if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
-            if !env_id.trim().is_empty() {
-                return Some(env_id.trim().to_string());
-            }
-        }
-        if let Ok(nlr_root) = crate::config::resolve_nlr_root() {
-            let cache = nlr_root.join(".nlr-workspace-id");
-            if let Ok(persisted) = fs::read_to_string(&cache) {
-                let id = persisted.trim();
-                if !id.is_empty() {
-                    return Some(id.to_string());
+    // Gate-37 CCC2 + Gate-38 DDD2: cache workspace_id per process to
+    // prevent mid-process tenant shift, but DON'T memoize a miss —
+    // a first call before `.nlr-workspace-id` exists must not brick
+    // every later call. Mutex-protected Option: read first; if None,
+    // try to resolve; if resolution succeeds, cache and return; if
+    // it fails, leave the slot at None so a later call (after embed
+    // populated the cache) can resolve.
+    let resolved_id = {
+        let mut slot = SEARCH_WORKSPACE_ID.lock().unwrap();
+        if let Some(ref id) = *slot {
+            Some(id.clone())
+        } else {
+            let resolved = (|| -> Option<String> {
+                if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
+                    if !env_id.trim().is_empty() {
+                        return Some(env_id.trim().to_string());
+                    }
                 }
+                if let Ok(nlr_root) = crate::config::resolve_nlr_root() {
+                    let cache = nlr_root.join(".nlr-workspace-id");
+                    if let Ok(persisted) = fs::read_to_string(&cache) {
+                        let id = persisted.trim();
+                        if !id.is_empty() {
+                            return Some(id.to_string());
+                        }
+                    }
+                }
+                None
+            })();
+            if let Some(ref id) = resolved {
+                *slot = Some(id.clone());
             }
+            resolved
         }
-        None
-    }).clone();
+    };
     if let Some(id) = resolved_id {
         search_body["filter"] = serde_json::json!({
             "must": [{
