@@ -346,14 +346,26 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
             if seen_rels.contains(&rel) {
                 continue;  // already SUCCESSFULLY upserted from an earlier root
             }
-            // Gate-42 HHH1: mirror BM25 GGG2 fix — skip unreadable/
-            // empty pages BEFORE embedding. unwrap_or_default sent ""
-            // to the embedder which returned a non-empty zero-ish
-            // vector; the upsert succeeded and seen_rels was marked,
-            // shadowing the healthy 02-KB-main fallback.
+            // Gate-42 HHH1 + Gate-43 III1: skip unreadable/empty pages
+            // BEFORE embedding. Additionally, when a page that was
+            // indexed by a prior run becomes blank/missing on disk,
+            // proactively DELETE its deterministic Qdrant point so it
+            // stops surfacing in search. Without this tombstone,
+            // deterministic IDs left previously-indexed-then-deleted
+            // content searchable forever (until manual recreate=true).
             let content = match fs::read_to_string(path) {
                 Ok(c) if !c.trim().is_empty() => c,
-                _ => continue,
+                _ => {
+                    // Tombstone the deterministic point for this rel.
+                    let stale_id = uuid::Uuid::new_v5(&workspace_ns, rel.as_bytes()).to_string();
+                    let delete_url = format!("{qdrant_url}/collections/{collection}/points/delete");
+                    let _ = client
+                        .post(&delete_url)
+                        .json(&serde_json::json!({"points": [stale_id]}))
+                        .send()
+                        .await;
+                    continue;
+                }
             };
 
             let embed_resp = client

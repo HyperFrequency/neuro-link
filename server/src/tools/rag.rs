@@ -136,23 +136,37 @@ pub fn call(name: &str, args: &Value, root: &Path) -> Result<String> {
         }
 
         "nlr_rag_rebuild_index" => {
-            // Rebuild keyword index (existing behavior)
-            let kb = root.join("02-KB-main");
+            // Rebuild keyword index. Gate-43 III2: walk DEFAULT_VAULT_DIRS
+            // (vaults/ canonical, 02-KB-main/ legacy) with rel-path
+            // dedup matching embed_wiki/BM25/auto-rag-inject. Earlier
+            // version walked only 02-KB-main/, leaving the prebuilt
+            // auto-rag-index legacy-only and letting the hook's first-
+            // strategy fast path serve stale content for vault installs.
             let skip = ["schema.md", "index.md", "log.md"];
             let mut keywords: HashMap<String, Vec<String>> = HashMap::new();
             let mut pages: HashMap<String, Value> = HashMap::new();
-            for entry in WalkDir::new(&kb).into_iter().filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if !path.extension().is_some_and(|e| e == "md") || skip.iter().any(|s| path.file_name().is_some_and(|f| f == *s)) { continue; }
-                let content = fs::read_to_string(path).unwrap_or_default();
-                let rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
-                let stem = path.file_stem().unwrap_or_default().to_string_lossy().replace('-', " ");
-                let overview: String = content.lines().filter(|l| !l.starts_with("---") && !l.starts_with('#') && !l.is_empty()).take(3).collect::<Vec<_>>().join(" ");
-                for word in stem.split_whitespace().chain(content.split_whitespace().take(100)) {
-                    let w = word.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
-                    if w.len() > 3 { keywords.entry(w).or_default().push(rel.clone()); }
+            let mut seen_rels: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for vault_name in crate::embed::DEFAULT_VAULT_DIRS {
+                let kb = root.join(vault_name);
+                if !kb.is_dir() { continue; }
+                for entry in WalkDir::new(&kb).into_iter().filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if !path.extension().is_some_and(|e| e == "md") || skip.iter().any(|s| path.file_name().is_some_and(|f| f == *s)) { continue; }
+                    let rel = path.strip_prefix(&kb).unwrap_or(path).display().to_string();
+                    if seen_rels.contains(&rel) { continue; }
+                    let content = match fs::read_to_string(path) {
+                        Ok(c) if !c.trim().is_empty() => c,
+                        _ => continue,
+                    };
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy().replace('-', " ");
+                    let overview: String = content.lines().filter(|l| !l.starts_with("---") && !l.starts_with('#') && !l.is_empty()).take(3).collect::<Vec<_>>().join(" ");
+                    for word in stem.split_whitespace().chain(content.split_whitespace().take(100)) {
+                        let w = word.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                        if w.len() > 3 { keywords.entry(w).or_default().push(rel.clone()); }
+                    }
+                    pages.insert(rel.clone(), json!({"title": stem, "overview": &overview[..overview.len().min(200)]}));
+                    seen_rels.insert(rel);
                 }
-                pages.insert(rel, json!({"title": stem, "overview": &overview[..overview.len().min(200)]}));
             }
             let index = json!({"keywords": keywords, "pages": pages});
             fs::write(root.join("state/auto-rag-index.json"), serde_json::to_string_pretty(&index)?)?;
