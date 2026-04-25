@@ -366,31 +366,41 @@ def check_qmd() -> dict[str, Any]:
     return _fail("qmd", f"collection list exit {rc}: {out[:200]}")
 
 
+REQUIRED_LLAMA_PORTS = [8400, 8401]  # embed + rerank
+OPTIONAL_LLAMA_PORTS = [8402]        # qexpand (informational)
+
+
 def check_llama_servers() -> dict[str, Any]:
     if "llama-servers" in SKIP or OFFLINE:
         return _skipped("llama-servers", "NLR_VERIFY_OFFLINE or SKIP")
-    reachable = []
-    down = []
-    for port in WARM_LLAMA_PORTS:
+    # Gate-26 RR1: per-port REQUIRED check, not "at least 1". The live
+    # RAG path is octen_search → :8400 (embed) → qdrant → :8401 (rerank).
+    # Both endpoints are non-substitutable — :8402 (qexpand) is
+    # informational only and doesn't gate ready. Earlier "any 1
+    # reachable" let proof-full pass with embed down + qexpand up,
+    # which would still break user-visible retrieval at runtime.
+    req_down: list[int] = []
+    req_up: list[int] = []
+    for port in REQUIRED_LLAMA_PORTS:
         ok, _ = _http_ok(f"http://127.0.0.1:{port}/v1/models", timeout=2.0)
-        (reachable if ok else down).append(port)
-    if not reachable:
-        # Gate-25 QQ2: promoted from warn to fail. `proof-full`
-        # explicitly runs with OFFLINE=0 and skips=[] — it is the
-        # live-stack audit, so zero reachable llama servers is a
-        # genuine red for completeness. If the user wants to skip the
-        # whole block, NLR_VERIFY_OFFLINE=1 or NLR_VERIFY_SKIP=llama-
-        # servers still short-circuits (returns _skipped above).
+        (req_up if ok else req_down).append(port)
+    opt_up: list[int] = []
+    opt_down: list[int] = []
+    for port in OPTIONAL_LLAMA_PORTS:
+        ok, _ = _http_ok(f"http://127.0.0.1:{port}/v1/models", timeout=2.0)
+        (opt_up if ok else opt_down).append(port)
+    if req_down:
         return _fail(
             "llama-servers",
-            f"no warm llama-servers reachable on {WARM_LLAMA_PORTS}; expected at least 1",
+            f"required llama ports down: {req_down} (need ALL of {REQUIRED_LLAMA_PORTS}); reachable: {req_up + opt_up}",
         )
+    note = f"required {req_up} OK; optional {opt_up} OK, {opt_down} down"
     return {
         "name": "llama-servers",
         "status": "pass",
-        "note": f"{len(reachable)}/{len(WARM_LLAMA_PORTS)} reachable",
-        "reachable": reachable,
-        "down": down,
+        "note": note,
+        "reachable": req_up + opt_up,
+        "down": req_down + opt_down,
     }
 
 

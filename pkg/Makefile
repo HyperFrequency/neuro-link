@@ -109,12 +109,18 @@ proof:
 	@cat $(PROOF_DIR)/ALL.ready.json | python3 -m json.tool | head -40
 
 proof-full:
-	# Gate-24 PP1 + Gate-25 QQ3: verify.py writes its own proof file
-	# (INSTALL_COMPLETE.{ready,incomplete,fail}.json depending on
-	# state). The Makefile no longer redirects stdout — prior
-	# `> INSTALL_COMPLETE.ready.json` would land the file under the
-	# .ready.json name even on fail state, defeating the QQ3
-	# "file presence = ready" property.
+	# Gate-24 PP1 + Gate-25 QQ3 + Gate-26 RR2: verify.py writes its
+	# own proof file (INSTALL_COMPLETE.{ready,incomplete,fail}.json).
+	# The defensive rm here protects the file-presence-equals-ready
+	# invariant against verifier startup failures (interpreter not
+	# found, import error, write-path issue) — without it, a stale
+	# .ready.json from a prior green run could survive and mislead
+	# downstream consumers. verify.py's main() also clears stale state
+	# files but only after it reaches that code path; this rm runs
+	# before the interpreter is even invoked.
+	@rm -f $(PROOF_DIR)/INSTALL_COMPLETE.ready.json \
+	       $(PROOF_DIR)/INSTALL_COMPLETE.incomplete.json \
+	       $(PROOF_DIR)/INSTALL_COMPLETE.fail.json
 	@echo "Running full install-completeness verifier (no skips, live probes):"
 	@NLR_VERIFY_OFFLINE=0 NLR_VERIFY_SKIP= python3 pkg/scripts/verify.py \
 	  || (echo "ERROR: verify.py reported install-completeness failure (see above)"; exit 1)
