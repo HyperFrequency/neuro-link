@@ -21,7 +21,29 @@ fi
 cp "$CLAUDE_JSON" "$CLAUDE_JSON.bak.$(date +%s)"
 
 # Build the three server entries
-NLR_BIN="${NLR_BIN:-$REPO_ROOT/server/target/release/neuro-link}"
+# Gate-61 AAAA1: package builders emit the binary at platform-specific
+# paths (target/aarch64-apple-darwin/release on macOS, target/x86_64-
+# unknown-linux-gnu/release on Linux) rather than the generic
+# server/target/release/neuro-link path. Probe candidate locations and
+# pick the first that exists. NLR_BIN= override always wins.
+if [[ -z "${NLR_BIN:-}" ]]; then
+  for candidate in \
+    "$REPO_ROOT/server/target/release/neuro-link" \
+    "$REPO_ROOT/server/target/aarch64-apple-darwin/release/neuro-link" \
+    "$REPO_ROOT/server/target/x86_64-apple-darwin/release/neuro-link" \
+    "$REPO_ROOT/server/target/x86_64-unknown-linux-gnu/release/neuro-link" \
+    "$REPO_ROOT/server/target/aarch64-unknown-linux-gnu/release/neuro-link"; do
+    if [[ -x "$candidate" ]]; then
+      NLR_BIN="$candidate"
+      break
+    fi
+  done
+  # Fall back to the generic path even if missing — the installer's
+  # post-install validation (verify.py + install-mirror.sh) will surface
+  # the broken binary instead of silently registering a path that points
+  # nowhere AND skipping validation.
+  NLR_BIN="${NLR_BIN:-$REPO_ROOT/server/target/release/neuro-link}"
+fi
 TV_BIN="${TV_BIN:-$HOME/.cargo/bin/turbovault}"
 
 cat > /tmp/nlr-mcp-patch.json <<JSON
