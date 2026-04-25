@@ -51,68 +51,85 @@ const DEFAULT_ALLOWED_PATHS: &[&str] = &[
     "config",
 ];
 
-/// Read allowed_paths from config/neuro-link.md frontmatter. Supports
-/// three forms:
-///   1. inline scalar:    `allowed_paths: 00-raw, 02-KB-main`
-///   2. YAML sequence:    `allowed_paths:\n  - 00-raw\n  - 02-KB-main`
-///   3. literal "all":    `allowed_paths: all` → returns DEFAULT
+/// Read allowed_paths from config/neuro-link.md frontmatter using
+/// real YAML parsing via serde_yaml. Supports every valid spelling:
+///   - inline scalar:           `allowed_paths: 00-raw, 02-KB-main`
+///   - block sequence:          `allowed_paths:\n  - vaults\n  - 02-KB-main`
+///   - flow sequence:           `allowed_paths: [vaults, 02-KB-main]`
+///   - quoted "all" or scalar:  `allowed_paths: "all"` / `'02-KB-main'`
+///   - empty sequence:          `allowed_paths: []`  → deny all
+///   - literal "all":           `allowed_paths: all` → DEFAULT
 ///
-/// Gate-52 RRR1: prior parser only handled form 1; a standard YAML
-/// list silently fell through to DEFAULT_ALLOWED_PATHS, re-exposing
-/// vault roots the operator tried to exclude. Now we detect form 2
-/// (key: present, value empty on same line) and consume subsequent
-/// `  - item` lines until indentation drops or another key starts.
-/// Malformed allowed_paths fail CLOSED (empty allowlist → no access)
-/// rather than reverting to defaults that include vault roots.
+/// Gate-54 TTT1: replaces the hand-rolled line parser (Gate-52 RRR1)
+/// with serde_yaml. Hand parser silently mangled flow sequences and
+/// inline comments into deny-all outages. Real YAML parsing eliminates
+/// that class of bug. On parse failure (malformed YAML, missing
+/// frontmatter), prints a single-line warning to stderr and returns
+/// DEFAULT — preferring availability for syntax errors over silent
+/// lockout, since the operator hasn't expressed an explicit policy.
+/// Explicit empty-list (`allowed_paths: []`) is honored as deny-all.
 pub fn allowed_paths(root: &Path) -> Vec<String> {
     let config_path = root.join("config/neuro-link.md");
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        let mut lines = content.lines().enumerate();
-        while let Some((_idx, line)) = lines.next() {
-            let trimmed = line.trim_end();
-            let stripped = trimmed.trim_start();
-            if !stripped.starts_with("allowed_paths:") {
-                continue;
-            }
-            let val = stripped.strip_prefix("allowed_paths:").unwrap_or("").trim();
-            if val == "all" {
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect(),
+    };
+    // Extract the YAML frontmatter block (between leading --- markers).
+    let frontmatter: Option<&str> = (|| -> Option<&str> {
+        let after_first = content.strip_prefix("---")?;
+        let nl = after_first.find('\n')?;
+        let body = &after_first[nl + 1..];
+        let end = body.find("\n---")?;
+        Some(&body[..end])
+    })();
+    let yaml_text = match frontmatter {
+        Some(f) => f,
+        None => return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect(),
+    };
+    let parsed: serde_yaml::Value = match serde_yaml::from_str(yaml_text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[config] WARN: malformed YAML frontmatter in {} ({}); falling back to DEFAULT_ALLOWED_PATHS",
+                config_path.display(),
+                e
+            );
+            return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect();
+        }
+    };
+    let val = match parsed.get("allowed_paths") {
+        Some(v) => v,
+        None => return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect(),
+    };
+    match val {
+        serde_yaml::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.eq_ignore_ascii_case("all") {
                 return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect();
             }
-            if !val.is_empty() {
-                // Form 1: inline comma-separated scalar.
-                return val
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-            // Form 2: YAML sequence on subsequent lines.
-            let mut items: Vec<String> = Vec::new();
-            for (_n, l) in lines.by_ref() {
-                let raw = l.trim_end();
-                let lstripped = raw.trim_start();
-                if lstripped.is_empty() {
-                    continue;
-                }
-                if let Some(item) = lstripped.strip_prefix("- ") {
-                    items.push(item.trim().trim_matches('"').trim_matches('\'').to_string());
-                    continue;
-                }
-                if let Some(item) = lstripped.strip_prefix("-") {
-                    let cleaned = item.trim().trim_matches('"').trim_matches('\'').to_string();
-                    if !cleaned.is_empty() {
-                        items.push(cleaned);
-                        continue;
-                    }
-                }
-                // Non-sequence line at any indentation → end of list.
-                break;
-            }
-            // Items collected (possibly empty). Empty = fail closed.
-            return items;
+            // Inline comma-separated scalar fallback (legacy form).
+            trimmed
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+        serde_yaml::Value::Sequence(items) => items
+            .iter()
+            .filter_map(|v| match v {
+                serde_yaml::Value::String(s) => Some(s.trim().to_string()),
+                _ => None,
+            })
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => {
+            eprintln!(
+                "[config] WARN: allowed_paths in {} has unsupported value type; falling back to DEFAULT_ALLOWED_PATHS",
+                config_path.display()
+            );
+            DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect()
         }
     }
-    DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect()
 }
 
 /// Check if a relative path (from NLR_ROOT) is within an allowed directory.
