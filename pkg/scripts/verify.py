@@ -639,16 +639,26 @@ def main() -> int:
     green = fails == 0
 
     PROOF_DIR.mkdir(parents=True, exist_ok=True)
-    # Gate-20 MM2: emit `state` alongside `green` so the same
-    # INSTALL_COMPLETE.ready.json file is consumable by both verify.py's
-    # own consumers (which use `green`) AND aggregate_proof.py
-    # (which keys off `state` for the per-target ship aggregator). The
-    # state mapping mirrors aggregate_proof's vocabulary:
-    #   green && fails==0   → "ready"
-    #   not-green           → "fail"
+    # Gate-20 MM2 + Gate-22 OO2: emit `state` consumed by
+    # aggregate_proof.py alongside `green` for verify.py's own callers.
+    #   - fails > 0        → "fail"       (hard red, aggregator fails closed)
+    #   - skips > 0        → "skipped_no_creds"  (partial run — e.g.
+    #                           `make all` offline pre-rag-up — aggregator
+    #                           treats like cloud-deferred: breaks strict
+    #                           green but keeps green_excluding_skipped)
+    #   - else (all pass)  → "ready"      (full green)
+    # This prevents `make all`'s intentionally-offline proof from
+    # masquerading as a full install-completeness attestation: only a
+    # `make proof-full` run with no skips emits state="ready".
+    if fails > 0:
+        state = "fail"
+    elif skips > 0:
+        state = "skipped_no_creds"
+    else:
+        state = "ready"
     out = {
         "target": "INSTALL_COMPLETE",
-        "state": "ready" if green else "fail",
+        "state": state,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "run_id": os.environ.get("NLR_RUN_ID", "unknown-run"),
         "green": green,

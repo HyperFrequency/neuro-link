@@ -121,7 +121,13 @@ def main(proof_dir: str) -> int:
             #     what the ship bundle can integrity-check on landing.
             if tgt == "INSTALL_COMPLETE":
                 pass  # state=ready alone is sufficient for the meta-proof
-            elif tgt in ("cloud-modal", "cloud-lambda", "cloud-ray"):
+            elif tgt in ("modal", "lambda", "ray"):
+                # Gate-22 OO1 fix: proof filenames are modal/lambda/ray
+                # (from pkg/cloud/{modal,lambda,ray}/deploy.sh), not the
+                # Make target names (cloud-modal/cloud-lambda/cloud-ray).
+                # Earlier NN2 tuple had the wrong names and silently let
+                # credentialed cloud deploys fall through to the
+                # builder-path sha256 check, forcing green=false.
                 if not data.get("artifact"):
                     all_green = False
                     all_green_excl_skipped = False
