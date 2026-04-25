@@ -18,28 +18,36 @@ use walkdir::WalkDir;
 /// This disambiguates the source of each indexed entry.
 pub const DEFAULT_VAULT_DIRS: &[&str] = &["vaults", "02-KB-main"];
 
-/// Return a stable workspace identifier so embed/search isolation on a
-/// shared Qdrant deployment survives worktree/path moves. Resolution
-/// order: NLR_WORKSPACE_ID env → cached `<root>/.nlr-workspace-id` file
-/// → freshly minted UUIDv4 written to that file. The file is treated
-/// as a workspace artifact (gitignored by convention so each clone
-/// gets its own).
-pub fn resolve_workspace_id(root: &Path) -> String {
+/// Return a stable workspace identifier. Resolution order:
+///   1. NLR_WORKSPACE_ID env (wins; no fs side effects)
+///   2. Cached `<root>/.nlr-workspace-id` file
+///   3. Fresh UUIDv4 persisted to that file
+///
+/// Gate-34 ZZ2: returns Result so persistence failures (read-only
+/// checkout, permissions, full disk) propagate instead of silently
+/// minting a new UUID per run that breaks idempotency. Callers MUST
+/// either set NLR_WORKSPACE_ID explicitly or accept the fail.
+pub fn resolve_workspace_id(root: &Path) -> Result<String> {
     if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
         if !env_id.trim().is_empty() {
-            return env_id.trim().to_string();
+            return Ok(env_id.trim().to_string());
         }
     }
     let cache = root.join(".nlr-workspace-id");
     if let Ok(persisted) = fs::read_to_string(&cache) {
         let trimmed = persisted.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
     }
     let new_id = uuid::Uuid::new_v4().to_string();
-    let _ = fs::write(&cache, format!("{new_id}\n"));
-    new_id
+    fs::write(&cache, format!("{new_id}\n")).with_context(|| {
+        format!(
+            "failed to persist workspace id to {} — set NLR_WORKSPACE_ID explicitly or fix the path's writability",
+            cache.display()
+        )
+    })?;
+    Ok(new_id)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -227,7 +235,7 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
     // cached in the file on first call; re-embeds in any path of the
     // same repo continue overwriting the same point IDs.
     let mut seen_rels: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let workspace_id = resolve_workspace_id(root);
+    let workspace_id = resolve_workspace_id(root)?;
     let workspace_ns =
         uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, workspace_id.as_bytes());
     for vault_name in DEFAULT_VAULT_DIRS {
@@ -362,45 +370,53 @@ pub async fn search_wiki(
         anyhow::bail!("Empty embedding vector");
     }
 
-    // Gate-33 YY1: filter searches by workspace_id. On a shared
-    // Qdrant deployment without this filter, workspace A could
-    // retrieve workspace B's documents because the collection is
-    // global. Resolve workspace_id from env or cwd's
-    // .nlr-workspace-id file; if neither resolves (no env, no
-    // file), search unfiltered (preserves single-workspace ergonomics).
+    // Gate-33 YY1 + Gate-34 ZZ1: filter searches by workspace_id, and
+    // resolve the ID from the SAME source embed_wiki uses — NLR_ROOT
+    // env or NLR_WORKSPACE_ID env — not cwd. The MCP server commonly
+    // runs from a different cwd than the repo root; cwd-based lookup
+    // would silently fall through to an unfiltered query and leak
+    // another tenant's documents on a shared Qdrant collection.
+    // Resolution order:
+    //   1. NLR_WORKSPACE_ID env
+    //   2. <NLR_ROOT>/.nlr-workspace-id (NLR_ROOT must be set for the
+    //      MCP server to find its vault — same source of truth here)
+    // If neither resolves, NLR_ALLOW_UNFILTERED_SEARCH=1 is required
+    // to fall through to unfiltered (single-workspace dev ergonomics).
+    // Otherwise we fail closed instead of leaking cross-workspace.
     let mut search_body = serde_json::json!({
         "vector": vector,
         "limit": limit,
         "with_payload": true
     });
+    let mut resolved_id: Option<String> = None;
     if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
         if !env_id.trim().is_empty() {
-            search_body["filter"] = serde_json::json!({
-                "must": [{
-                    "key": "workspace_id",
-                    "match": {"value": env_id.trim()}
-                }]
-            });
+            resolved_id = Some(env_id.trim().to_string());
         }
-    } else {
-        // Fall back to cwd's persisted id if present; do NOT mint a
-        // new one here (search shouldn't have side effects).
-        let cwd_cache = std::env::current_dir()
-            .ok()
-            .map(|d| d.join(".nlr-workspace-id"));
-        if let Some(cache_path) = cwd_cache {
-            if let Ok(persisted) = fs::read_to_string(&cache_path) {
+    }
+    if resolved_id.is_none() {
+        if let Ok(nlr_root) = std::env::var("NLR_ROOT") {
+            let cache = std::path::PathBuf::from(&nlr_root).join(".nlr-workspace-id");
+            if let Ok(persisted) = fs::read_to_string(&cache) {
                 let id = persisted.trim();
                 if !id.is_empty() {
-                    search_body["filter"] = serde_json::json!({
-                        "must": [{
-                            "key": "workspace_id",
-                            "match": {"value": id}
-                        }]
-                    });
+                    resolved_id = Some(id.to_string());
                 }
             }
         }
+    }
+    if let Some(id) = resolved_id {
+        search_body["filter"] = serde_json::json!({
+            "must": [{
+                "key": "workspace_id",
+                "match": {"value": id}
+            }]
+        });
+    } else if std::env::var("NLR_ALLOW_UNFILTERED_SEARCH").as_deref() != Ok("1") {
+        anyhow::bail!(
+            "search_wiki: no workspace_id resolvable (set NLR_WORKSPACE_ID or NLR_ROOT, \
+             or NLR_ALLOW_UNFILTERED_SEARCH=1 to opt into unfiltered single-workspace mode)"
+        );
     }
     let resp = client
         .post(format!("{qdrant_url}/collections/nlr_wiki/points/search"))
