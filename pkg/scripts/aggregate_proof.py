@@ -108,17 +108,23 @@ def main(proof_dir: str) -> int:
             # green_excluding_skipped. A cred'd re-run flips these to ready.
             all_green = False
         elif state == "ready":
-            # Gate-20 MM3: INSTALL_COMPLETE is a meta-proof written by
-            # verify.py (install-completeness gate), not a per-target
-            # builder proof. Builder proofs must carry an artifact + its
-            # sha256 so the ship bundle is integrity-checked. verify.py
-            # attests to POST-build completeness (MCP wired, hooks
-            # mirrored, arch correct) — there is no artifact. Accept
-            # state:"ready" from INSTALL_COMPLETE without the
-            # artifact/sha256 requirement; all other targets still
-            # require both to go green.
+            # Gate-20 MM3 + Gate-21 NN2: different ready-state integrity
+            # contracts for different target classes.
+            #   INSTALL_COMPLETE (meta-proof from verify.py): no binary
+            #     artifact exists, so state=ready alone is sufficient.
+            #   Cloud targets (modal/lambda/ray deployments): artifact
+            #     is a URL/ARN, not a file on disk — there is no local
+            #     sha256 to verify against. Require artifact to be
+            #     non-null, but don't require sha256.
+            #   Builder targets (macos/linux-*/docker): artifact is a
+            #     file path. Require BOTH sha256 and artifact to match
+            #     what the ship bundle can integrity-check on landing.
             if tgt == "INSTALL_COMPLETE":
                 pass  # state=ready alone is sufficient for the meta-proof
+            elif tgt in ("cloud-modal", "cloud-lambda", "cloud-ray"):
+                if not data.get("artifact"):
+                    all_green = False
+                    all_green_excl_skipped = False
             elif not data.get("sha256") or not data.get("artifact"):
                 all_green = False
                 all_green_excl_skipped = False

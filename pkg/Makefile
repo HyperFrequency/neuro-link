@@ -95,15 +95,23 @@ proof-full: PROOF_OFFLINE := 0
 proof-full: PROOF_SKIP :=
 
 proof proof-full:
-	@python3 pkg/scripts/aggregate_proof.py $(PROOF_DIR) > $(PROOF_DIR)/ALL.ready.json
-	@echo "ALL.ready.json written:"
-	@cat $(PROOF_DIR)/ALL.ready.json | python3 -m json.tool | head -40
-	@echo
+	# Gate-21 NN1: verify.py runs FIRST so the fresh
+	# INSTALL_COMPLETE.ready.json is on disk before aggregate_proof.py
+	# discovers it. Prior order (aggregate first, verify after) meant
+	# clean runs missed the meta-proof entirely, and retries could
+	# aggregate a stale INSTALL_COMPLETE before the current verify
+	# overwrote it. Also delete any stale file up front so retries
+	# can't leak an outdated success into the aggregate.
+	@rm -f $(PROOF_DIR)/INSTALL_COMPLETE.ready.json
 	@echo "Running install-completeness verifier (offline=$(PROOF_OFFLINE) skip=[$(PROOF_SKIP)]):"
 	@NLR_VERIFY_OFFLINE=$(PROOF_OFFLINE) NLR_VERIFY_SKIP=$(PROOF_SKIP) \
 	    python3 pkg/scripts/verify.py > $(PROOF_DIR)/INSTALL_COMPLETE.ready.json \
 	  && cat $(PROOF_DIR)/INSTALL_COMPLETE.ready.json | python3 -m json.tool | head -30 \
 	  || (echo "ERROR: verify.py reported install-completeness failure (see above)"; exit 1)
+	@echo
+	@echo "Aggregating all .ready.json proofs into ALL.ready.json:"
+	@python3 pkg/scripts/aggregate_proof.py $(PROOF_DIR) > $(PROOF_DIR)/ALL.ready.json
+	@cat $(PROOF_DIR)/ALL.ready.json | python3 -m json.tool | head -40
 
 clean:
 	rm -rf $(DIST_DIR) $(PROOF_DIR)
