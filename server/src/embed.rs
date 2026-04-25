@@ -65,18 +65,31 @@ pub fn resolve_workspace_id(root: &Path) -> Result<String> {
             Ok(new_id)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Another concurrent caller won the race — read its UUID.
-            let persisted = fs::read_to_string(&cache).with_context(|| {
-                format!("workspace id file {} appeared but is unreadable", cache.display())
-            })?;
-            let trimmed = persisted.trim();
-            if trimmed.is_empty() {
-                anyhow::bail!(
-                    "workspace id file {} exists but is empty (concurrent create raced)",
-                    cache.display()
-                );
+            // Gate-36 BBB1: another caller won the race. The file
+            // exists but they may not have flushed the UUID yet
+            // (create_new is atomic; write_all is not). Retry-read
+            // with backoff up to ~500 ms total before giving up.
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_millis(500);
+            let mut backoff_ms: u64 = 5;
+            loop {
+                if let Ok(persisted) = fs::read_to_string(&cache) {
+                    let trimmed = persisted.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(trimmed.to_string());
+                    }
+                }
+                if start.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "workspace id file {} exists but is empty after {:?} \
+                         (concurrent create may have stalled or failed)",
+                        cache.display(),
+                        timeout
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(50);
             }
-            Ok(trimmed.to_string())
         }
         Err(e) => Err(anyhow::Error::from(e).context(format!(
             "failed to create workspace id file at {} — set NLR_WORKSPACE_ID explicitly or fix path writability",
@@ -430,8 +443,12 @@ pub async fn search_wiki(
         }
     }
     if resolved_id.is_none() {
-        if let Ok(nlr_root) = std::env::var("NLR_ROOT") {
-            let cache = std::path::PathBuf::from(&nlr_root).join(".nlr-workspace-id");
+        // Gate-36 BBB2: use the same root-resolution path the MCP
+        // server uses (env → ~/.claude/state/nlr_root → cwd marker
+        // file). Prior code only looked at NLR_ROOT env and hard-failed
+        // on valid startup modes that resolve via state-file or cwd.
+        if let Ok(nlr_root) = crate::config::resolve_nlr_root() {
+            let cache = nlr_root.join(".nlr-workspace-id");
             if let Ok(persisted) = fs::read_to_string(&cache) {
                 let id = persisted.trim();
                 if !id.is_empty() {
