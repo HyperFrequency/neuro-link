@@ -212,22 +212,46 @@ pub async fn handle_mcp(
                     rel_path.strip_prefix(&p)
                 })
             };
-            let candidates: Vec<std::path::PathBuf> = if let Some(vrel) = vault_rel {
+            // Build (vault_root, candidate_path) pairs so the post-
+            // canonicalize containment check (gate-49 OOO1) can verify
+            // each resolved path stays under its OWN vault root —
+            // catches symlink escapes from an allowed vault into an
+            // excluded one.
+            let candidate_pairs: Vec<(std::path::PathBuf, std::path::PathBuf)> = if let Some(vrel) = vault_rel {
                 vault_dirs
                     .iter()
                     .filter(|v| allowed_set.contains(*v))
-                    .map(|v| root.join(v).join(vrel))
+                    .map(|v| {
+                        let vault_root = root.join(v);
+                        let candidate = vault_root.join(vrel);
+                        (vault_root, candidate)
+                    })
                     .collect()
             } else {
-                vec![root.join(rel_path)]
+                vec![(root.to_path_buf(), root.join(rel_path))]
             };
+            // Gate-49 OOO1: per-candidate containment. canonicalize()
+            // follows symlinks; without verifying the resolved path
+            // stays under the SPECIFIC vault root we're authorized
+            // for, a symlink in vaults/foo.md → 02-KB-main/secret.md
+            // (or any non-allowed sibling) would be served.
             let mut chosen: Option<(std::path::PathBuf, String)> = None;
-            for candidate in candidates {
+            for (vault_root, candidate) in candidate_pairs {
                 let canonical = match candidate.canonicalize() {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
                 if !canonical.starts_with(&root_canonical) {
+                    continue;
+                }
+                // Tighter check: must stay under THIS vault root
+                // (symlink escape protection). Skip if vault_root
+                // itself can't be canonicalized — defensive.
+                let vault_canonical = match vault_root.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if !canonical.starts_with(&vault_canonical) {
                     continue;
                 }
                 match std::fs::read_to_string(&canonical) {
