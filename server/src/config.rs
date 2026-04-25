@@ -77,8 +77,19 @@ pub fn is_path_allowed(root: &Path, rel_path: &str) -> bool {
     if allowed.is_empty() {
         return true;
     }
-    for prefix in &allowed {
-        if rel_path.starts_with(prefix.as_str()) {
+    // Gate-45 KKK2: match the FIRST PATH SEGMENT, not raw string
+    // prefix. Prior `starts_with` let `vaults-private/...` or
+    // `02-KB-main-archive/...` slip through under the default
+    // allowlist because the first allowed entry's name was a string
+    // prefix of those siblings. Now `vaults` matches `vaults` and
+    // `vaults/...` exactly, never `vaults-private/...`.
+    let first_segment = rel_path
+        .trim_start_matches('/')
+        .split(['/', std::path::MAIN_SEPARATOR])
+        .next()
+        .unwrap_or("");
+    for allowed_dir in &allowed {
+        if first_segment == allowed_dir.as_str() {
             return true;
         }
     }

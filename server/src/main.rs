@@ -214,9 +214,22 @@ fn handle_resources_list(id: Option<Value>, root: &std::path::Path) -> JsonRpcRe
                         .unwrap_or(&path)
                         .display()
                         .to_string();
-                    if !seen.insert(rel.clone()) {
+                    if seen.contains(&rel) {
                         continue; // already listed from a higher-priority vault
                     }
+                    // Gate-45 KKK1: skip whitespace-only files BEFORE
+                    // marking seen — matches embed_wiki + BM25 +
+                    // nlr_rag_rebuild_index. Without this, a blank
+                    // vaults/foo.md shadowed populated 02-KB-main/foo.md
+                    // in the resource list while indexers correctly
+                    // fell through to the legacy copy.
+                    let is_non_empty = std::fs::read_to_string(&path)
+                        .map(|c| !c.trim().is_empty())
+                        .unwrap_or(false);
+                    if !is_non_empty {
+                        continue;
+                    }
+                    seen.insert(rel.clone());
                     out.push(serde_json::json!({
                         "uri": format!("nlr://wiki/{rel}"),
                         "name": rel,
@@ -255,10 +268,10 @@ fn handle_resources_read(
         return JsonRpcResponse::error(id, -32602, "Invalid path: traversal not allowed".into());
     }
 
-    // Gate-40 FFF2: try each vault root in priority order. embed_wiki
-    // emits payload.path relative to whichever root holds the file
-    // (vaults/ wins over 02-KB-main/), so the resource read must
-    // attempt every vault root the indexer walks.
+    // Gate-40 FFF2 + Gate-45 KKK1: try each vault root in priority
+    // order, but only accept a candidate that has non-empty content.
+    // Without the emptiness check, a blank vaults/foo.md shadowed a
+    // populated 02-KB-main/foo.md — search hits couldn't be hydrated.
     let mut canonical: Option<std::path::PathBuf> = None;
     let mut allowed_canonical: Option<std::path::PathBuf> = None;
     for vault_name in crate::embed::DEFAULT_VAULT_DIRS {
@@ -266,11 +279,19 @@ fn handle_resources_read(
         let candidate = vault_root.join(rel_path);
         if let Ok(c) = candidate.canonicalize() {
             let vault_canonical = vault_root.canonicalize().unwrap_or(vault_root);
-            if c.starts_with(&vault_canonical) {
-                canonical = Some(c);
-                allowed_canonical = Some(vault_canonical);
-                break;
+            if !c.starts_with(&vault_canonical) {
+                continue;
             }
+            // Skip blank files so the next vault root gets a chance.
+            let is_non_empty = std::fs::read_to_string(&c)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !is_non_empty {
+                continue;
+            }
+            canonical = Some(c);
+            allowed_canonical = Some(vault_canonical);
+            break;
         }
     }
     let canonical = match canonical {
