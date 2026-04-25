@@ -131,7 +131,17 @@ pub async fn handle_mcp(
                                 .map(|c| !c.trim().is_empty())
                                 .unwrap_or(false);
                             if !is_non_empty { continue; }
-                            vault_seen.insert(vault_rel);
+                            vault_seen.insert(vault_rel.clone());
+                            // Gate-47 MMM2: vault entries use the same
+                            // nlr://wiki/{vault_rel} URI scheme as the
+                            // stdio transport so clients can round-trip
+                            // resource identifiers across transports.
+                            resources.push(json!({
+                                "uri": format!("nlr://wiki/{vault_rel}"),
+                                "name": vault_rel,
+                                "mimeType": "text/markdown"
+                            }));
+                            continue;
                         }
                         let rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
                         resources.push(json!({
@@ -149,35 +159,60 @@ pub async fn handle_mcp(
                 .and_then(|p| p.get("uri"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let rel_path = uri.strip_prefix("nlr://").unwrap_or(uri);
+            // Gate-47 MMM2: accept BOTH `nlr://wiki/{vault_rel}` (vault
+            // entry — same scheme stdio uses + new HTTP-vault-list
+            // emits) AND `nlr://{rel}` (legacy non-vault path). Vault
+            // form keeps the relative path under any vault root; legacy
+            // form is the absolute-from-repo-root path.
+            let (is_wiki_uri, rel_path) = if let Some(rest) = uri.strip_prefix("nlr://wiki/") {
+                (true, rest)
+            } else {
+                (false, uri.strip_prefix("nlr://").unwrap_or(uri))
+            };
             // Block traversal: reject .., absolute paths, and null bytes
             if rel_path.contains("..") || rel_path.starts_with('/') || rel_path.contains('\0') {
                 return Json(serde_json::to_value(JsonRpcResponse::error(
                     id, -32602, "Invalid path: traversal not allowed".into(),
                 )).unwrap_or(json!(null)));
             }
-            // Check allowed_paths
-            if !crate::config::is_path_allowed(root, rel_path) {
+            // Allowlist check uses the underlying vault path for the
+            // wiki form so a customized allowed_paths still gates.
+            let vault_dirs = crate::embed::DEFAULT_VAULT_DIRS;
+            let probe_path: String = if is_wiki_uri {
+                // For allowlist purposes, treat as the canonical vaults/
+                // path; if that's not allowed, the actual fallback loop
+                // below will further restrict to allowed roots only.
+                format!("{}/{rel_path}", vault_dirs[0])
+            } else {
+                rel_path.to_string()
+            };
+            if !crate::config::is_path_allowed(root, &probe_path) {
                 return Json(serde_json::to_value(JsonRpcResponse::error(
                     id, -32602, "Access denied: path not in allowed_paths".into(),
                 )).unwrap_or(json!(null)));
             }
-            // Gate-46 LLL1: vault-aware fallback. If rel_path is under
-            // a vault root (vaults/... or 02-KB-main/...) and the
-            // requested file is missing OR blank, try the same vault-
-            // relative path under the OTHER vault root in priority
-            // order. Mirrors the stdio handler's vault precedence.
+            // Gate-46 LLL1 + Gate-47 MMM1: vault-aware fallback that
+            // RESPECTS allowed_paths — if a vault root is excluded
+            // from the user's customized allowlist, it cannot be used
+            // as a fallback target (no cross-vault data leak).
+            let allowed = crate::config::allowed_paths(root);
+            let allowed_set: std::collections::HashSet<&str> =
+                allowed.iter().map(|s| s.as_str()).collect();
             let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-            let vault_dirs = crate::embed::DEFAULT_VAULT_DIRS;
-            let vault_rel: Option<&str> = vault_dirs
-                .iter()
-                .find_map(|v| {
+            // Determine vault_rel: extract from URI if wiki form, else
+            // from rel_path's first segment if it matches a vault dir.
+            let vault_rel: Option<&str> = if is_wiki_uri {
+                Some(rel_path)
+            } else {
+                vault_dirs.iter().find_map(|v| {
                     let p = format!("{}/", v);
                     rel_path.strip_prefix(&p)
-                });
+                })
+            };
             let candidates: Vec<std::path::PathBuf> = if let Some(vrel) = vault_rel {
                 vault_dirs
                     .iter()
+                    .filter(|v| allowed_set.contains(*v))
                     .map(|v| root.join(v).join(vrel))
                     .collect()
             } else {
