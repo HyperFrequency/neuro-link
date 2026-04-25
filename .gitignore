@@ -60,3 +60,8 @@ dev/
 
 # Install proof artifacts — generated per-run, never committed
 pkg/.proof/
+
+# Workspace identity for shared-Qdrant isolation (gate-33 YY2).
+# Each workspace generates its own UUID on first embed; never committed
+# so different clones get different IDs.
+.nlr-workspace-id

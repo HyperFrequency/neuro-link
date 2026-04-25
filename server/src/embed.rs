@@ -18,6 +18,30 @@ use walkdir::WalkDir;
 /// This disambiguates the source of each indexed entry.
 pub const DEFAULT_VAULT_DIRS: &[&str] = &["vaults", "02-KB-main"];
 
+/// Return a stable workspace identifier so embed/search isolation on a
+/// shared Qdrant deployment survives worktree/path moves. Resolution
+/// order: NLR_WORKSPACE_ID env → cached `<root>/.nlr-workspace-id` file
+/// → freshly minted UUIDv4 written to that file. The file is treated
+/// as a workspace artifact (gitignored by convention so each clone
+/// gets its own).
+pub fn resolve_workspace_id(root: &Path) -> String {
+    if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
+        if !env_id.trim().is_empty() {
+            return env_id.trim().to_string();
+        }
+    }
+    let cache = root.join(".nlr-workspace-id");
+    if let Ok(persisted) = fs::read_to_string(&cache) {
+        let trimmed = persisted.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let _ = fs::write(&cache, format!("{new_id}\n"));
+    new_id
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     pub path: String,
@@ -193,20 +217,19 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
     // reverse is also true — a repo that has already moved everything to
     // `vaults/` doesn't need a placeholder `02-KB-main/`.
     // Gate-31 WW2 + Gate-32 XX1: dedupe by relative path across roots,
-    // but only AFTER a successful upsert. If vaults/x.md fails to
-    // read/embed/upsert, 02-KB-main/x.md must still be tried — prior
-    // logic marked the path as seen pre-upsert and could drop a
-    // single-file failure in the preferred root.
-    // Gate-32 XX2: workspace-scoped UUID namespace. Different repos
-    // pointed at the same Qdrant collection (e.g. shared dev cluster)
-    // would otherwise generate the same v5 UUID for "docs/index.md"
-    // and silently overwrite each other. Mix the canonicalized root
-    // path into the namespace so each workspace gets its own ID space.
+    // but only AFTER a successful upsert.
+    // Gate-32 XX2 + Gate-33 YY2: workspace-scoped UUID v5 keyed off a
+    // STABLE workspace identifier (NLR_WORKSPACE_ID env or persisted
+    // <root>/.nlr-workspace-id file), NOT the canonical filesystem
+    // path. Path-based namespaces broke retries across worktrees,
+    // CI temp dirs, or moved checkouts — same logical repo got new
+    // namespaces and re-embeds piled up duplicates. The stable ID is
+    // cached in the file on first call; re-embeds in any path of the
+    // same repo continue overwriting the same point IDs.
     let mut seen_rels: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let workspace_ns = {
-        let root_path = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, root_path.to_string_lossy().as_bytes())
-    };
+    let workspace_id = resolve_workspace_id(root);
+    let workspace_ns =
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, workspace_id.as_bytes());
     for vault_name in DEFAULT_VAULT_DIRS {
         let vault_root = root.join(vault_name);
         if !vault_root.is_dir() {
@@ -271,7 +294,11 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
                     "points": [{
                         "id": point_id,
                         "vector": vector,
-                        "payload": { "path": rel, "preview": &content[..content.len().min(500)] }
+                        "payload": {
+                            "path": rel,
+                            "preview": &content[..content.len().min(500)],
+                            "workspace_id": &workspace_id
+                        }
                     }]
                 }))
                 .send()
@@ -335,13 +362,49 @@ pub async fn search_wiki(
         anyhow::bail!("Empty embedding vector");
     }
 
+    // Gate-33 YY1: filter searches by workspace_id. On a shared
+    // Qdrant deployment without this filter, workspace A could
+    // retrieve workspace B's documents because the collection is
+    // global. Resolve workspace_id from env or cwd's
+    // .nlr-workspace-id file; if neither resolves (no env, no
+    // file), search unfiltered (preserves single-workspace ergonomics).
+    let mut search_body = serde_json::json!({
+        "vector": vector,
+        "limit": limit,
+        "with_payload": true
+    });
+    if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
+        if !env_id.trim().is_empty() {
+            search_body["filter"] = serde_json::json!({
+                "must": [{
+                    "key": "workspace_id",
+                    "match": {"value": env_id.trim()}
+                }]
+            });
+        }
+    } else {
+        // Fall back to cwd's persisted id if present; do NOT mint a
+        // new one here (search shouldn't have side effects).
+        let cwd_cache = std::env::current_dir()
+            .ok()
+            .map(|d| d.join(".nlr-workspace-id"));
+        if let Some(cache_path) = cwd_cache {
+            if let Ok(persisted) = fs::read_to_string(&cache_path) {
+                let id = persisted.trim();
+                if !id.is_empty() {
+                    search_body["filter"] = serde_json::json!({
+                        "must": [{
+                            "key": "workspace_id",
+                            "match": {"value": id}
+                        }]
+                    });
+                }
+            }
+        }
+    }
     let resp = client
         .post(format!("{qdrant_url}/collections/nlr_wiki/points/search"))
-        .json(&serde_json::json!({
-            "vector": vector,
-            "limit": limit,
-            "with_payload": true
-        }))
+        .json(&search_body)
         .send()
         .await
         .context("Qdrant search failed")?;
