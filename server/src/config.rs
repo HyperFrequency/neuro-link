@@ -70,33 +70,79 @@ const DEFAULT_ALLOWED_PATHS: &[&str] = &[
 /// Explicit empty-list (`allowed_paths: []`) is honored as deny-all.
 pub fn allowed_paths(root: &Path) -> Vec<String> {
     let config_path = root.join("config/neuro-link.md");
+    // Gate-55 UUU1 + UUU2: explicit failure modes distinguish missing
+    // (→ DEFAULT, no policy expressed) from malformed-but-present
+    // (→ DENY ALL, operator policy can't be parsed). Frontmatter
+    // extraction tolerates UTF-8 BOM, CRLF line endings, and leading
+    // blank lines/comments before the opening ---.
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
         Err(_) => return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect(),
     };
-    // Extract the YAML frontmatter block (between leading --- markers).
+    // Strip BOM and normalize CRLF for the rest of the parser.
+    let normalized = content
+        .strip_prefix('\u{FEFF}')
+        .unwrap_or(&content)
+        .replace("\r\n", "\n");
     let frontmatter: Option<&str> = (|| -> Option<&str> {
-        let after_first = content.strip_prefix("---")?;
-        let nl = after_first.find('\n')?;
-        let body = &after_first[nl + 1..];
-        let end = body.find("\n---")?;
-        Some(&body[..end])
+        // Skip leading blank lines and `#` comments before the opening
+        // delimiter. Find the first non-blank/non-comment line; it must
+        // be exactly `---` (with trailing whitespace allowed).
+        let mut idx = 0usize;
+        for line in normalized.split_inclusive('\n') {
+            let trimmed = line.trim_end_matches('\n').trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                idx += line.len();
+                continue;
+            }
+            if trimmed != "---" {
+                return None;
+            }
+            idx += line.len();
+            break;
+        }
+        let body = normalized.get(idx..)?;
+        // Closing delimiter: `---` on its own line.
+        let end_marker_pos = body.find("\n---").or_else(|| {
+            // Allow files that end without a trailing newline.
+            if body.trim_end_matches('\n').ends_with("\n---") {
+                Some(body.len() - 3)
+            } else {
+                None
+            }
+        })?;
+        Some(&body[..end_marker_pos])
     })();
     let yaml_text = match frontmatter {
         Some(f) => f,
-        None => return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect(),
+        None => {
+            // File exists but no parseable frontmatter. Codex gate-54
+            // UUU2: this case used to silently fall back to DEFAULT
+            // and re-broaden the allowlist. Now: if the operator went
+            // to the trouble of writing a config file we treat its
+            // unparseable frontmatter as malformed-policy → fail
+            // closed. The file's mere presence signals INTENT.
+            eprintln!(
+                "[config] WARN: {} exists but YAML frontmatter could not be located (BOM/CRLF/missing --- markers?); failing closed (deny all)",
+                config_path.display()
+            );
+            return Vec::new();
+        }
     };
     let parsed: serde_yaml::Value = match serde_yaml::from_str(yaml_text) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "[config] WARN: malformed YAML frontmatter in {} ({}); falling back to DEFAULT_ALLOWED_PATHS",
+                "[config] WARN: malformed YAML frontmatter in {} ({}); failing closed (deny all)",
                 config_path.display(),
                 e
             );
-            return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect();
+            return Vec::new();
         }
     };
+    // Codex gate-54 UUU1: only an ABSENT allowed_paths key yields
+    // DEFAULT_ALLOWED_PATHS — that's the "no policy" state. Present-
+    // but-invalid is treated as malformed-policy → fail closed.
     let val = match parsed.get("allowed_paths") {
         Some(v) => v,
         None => return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect(),
@@ -124,10 +170,10 @@ pub fn allowed_paths(root: &Path) -> Vec<String> {
             .collect(),
         _ => {
             eprintln!(
-                "[config] WARN: allowed_paths in {} has unsupported value type; falling back to DEFAULT_ALLOWED_PATHS",
+                "[config] WARN: allowed_paths in {} has unsupported value type; failing closed (deny all)",
                 config_path.display()
             );
-            DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect()
+            Vec::new()
         }
     }
 }
