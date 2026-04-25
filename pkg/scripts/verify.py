@@ -192,19 +192,37 @@ def check_mcp_servers() -> dict[str, Any]:
     if malformed_required:
         return _fail("mcp-servers", f"required registered but invalid: {'; '.join(malformed_required)}")
 
-    # Gate-16 II1: send the entry's configured headers (so a Bearer
-    # token misconfiguration surfaces as 401/403 here) and treat
-    # specific 4xx codes as failure. 2xx/3xx/405 still pass — 405
-    # means a live MCP listener that just doesn't speak GET. Headers
-    # may reference env vars like ${NLR_API_TOKEN} that the host
-    # shell expands; we evaluate those at probe time so an unset
-    # token shows up as a 401/403 from the real endpoint, not a
-    # false-positive pass.
+    # Gate-16 II1 + Gate-17 JJ1: protocol-aware MCP probe.
+    #   - Send the entry's configured headers (so misconfigured
+    #     ${NLR_API_TOKEN} surfaces as 401/403 from the real endpoint).
+    #   - Disable urllib's automatic redirect following — a misrouted
+    #     /mcp URL that 302s to a dashboard/login would otherwise end
+    #     up 200 OK and pass; we now treat 3xx as "wrong endpoint".
+    #   - POST a JSON-RPC `initialize` request and require the
+    #     response body to be a JSON object with .jsonrpc=="2.0" plus
+    #     either .result or .error. That proves the listener actually
+    #     speaks the MCP protocol, not just HTTP.
     def _resolve_header_value(raw: str) -> str:
         return os.path.expandvars(raw)
 
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+            return None  # tells urllib to NOT follow
+
+    _no_redirect_opener = urllib.request.build_opener(_NoRedirect)
+
     unreachable_required: list[str] = []
     if not OFFLINE:
+        init_payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "neuro-link-verify.py", "version": "0.1"},
+            },
+        }).encode("utf-8")
         for srv in REQUIRED_MCP_SERVERS:
             entry = servers[srv]
             transport = entry.get("type") or ("http" if isinstance(entry.get("url"), str) else "stdio")
@@ -212,21 +230,52 @@ def check_mcp_servers() -> dict[str, Any]:
                 continue
             url = entry.get("url", "")
             headers = {k: _resolve_header_value(v) for k, v in (entry.get("headers") or {}).items() if isinstance(v, str)}
+            headers["Content-Type"] = "application/json"
+            headers["Accept"] = "application/json, text/event-stream"
             try:
-                req = urllib.request.Request(url, headers=headers, method="GET")
-                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                req = urllib.request.Request(url, data=init_payload, headers=headers, method="POST")
+                with _no_redirect_opener.open(req, timeout=3.0) as resp:
+                    body = resp.read(8192)
                     code = resp.status
             except urllib.error.HTTPError as e:
+                # 3xx (redirect) lands here because we disabled following.
+                # Any 3xx/4xx/5xx is a fail for required servers.
                 code = e.code
+                unreachable_required.append(f"{srv}(HTTP {code})")
+                continue
             except Exception as e:
                 unreachable_required.append(f"{srv}({type(e).__name__})")
                 continue
-            # 2xx success, 3xx redirect, 405 method-not-allowed (live
-            # MCP that needs POST) → PASS. 401/403 auth, 404 wrong
-            # endpoint, other 4xx, 5xx → FAIL.
-            if code < 400 or code == 405:
+            if code >= 400:
+                unreachable_required.append(f"{srv}(HTTP {code})")
                 continue
-            unreachable_required.append(f"{srv}(HTTP {code})")
+            # 2xx — verify MCP-shape body. Streamable-HTTP returns a
+            # JSON object directly; SSE-transport returns a `data: {...}`
+            # event line. Accept either.
+            text = body.decode("utf-8", errors="replace").strip()
+            mcp_payload: dict[str, Any] | None = None
+            try:
+                mcp_payload = json.loads(text) if text.startswith("{") else None
+            except (json.JSONDecodeError, ValueError):
+                mcp_payload = None
+            if mcp_payload is None and "data:" in text:
+                # SSE shape: scan for first `data: {...}` line
+                for line in text.splitlines():
+                    if line.startswith("data:"):
+                        candidate = line[len("data:"):].strip()
+                        try:
+                            mcp_payload = json.loads(candidate)
+                            break
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+            if not isinstance(mcp_payload, dict):
+                unreachable_required.append(f"{srv}(non-JSON body)")
+                continue
+            if mcp_payload.get("jsonrpc") != "2.0":
+                unreachable_required.append(f"{srv}(missing jsonrpc:2.0)")
+                continue
+            if "result" not in mcp_payload and "error" not in mcp_payload:
+                unreachable_required.append(f"{srv}(no JSON-RPC result/error)")
     if unreachable_required:
         return _fail(
             "mcp-servers",
