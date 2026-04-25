@@ -18,6 +18,11 @@ use walkdir::WalkDir;
 /// This disambiguates the source of each indexed entry.
 pub const DEFAULT_VAULT_DIRS: &[&str] = &["vaults", "02-KB-main"];
 
+/// Process-global cache of the search-time workspace ID (gate-37 CCC2).
+/// First call to search_wiki resolves env / NLR_ROOT cache, subsequent
+/// calls reuse the same value to prevent mid-process tenant shift.
+static SEARCH_WORKSPACE_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 /// Return a stable workspace identifier. Resolution order:
 ///   1. NLR_WORKSPACE_ID env (wins; no fs side effects)
 ///   2. Cached `<root>/.nlr-workspace-id` file
@@ -44,57 +49,70 @@ pub fn resolve_workspace_id(root: &Path) -> Result<String> {
             return Ok(trimmed.to_string());
         }
     }
-    // Slow path: try to atomically create the file with our UUID.
-    // If another process won the race, AlreadyExists tells us to
-    // re-read the file and use whatever they wrote.
+    // Slow path: write the UUID to a uniquely-named temp file (PID +
+    // UUID-suffixed so concurrent processes don't collide), then
+    // atomically `hard_link` it into the cache path. Gate-37 CCC1:
+    // prior `create_new` on the cache path could leave an empty-file
+    // tombstone after a crashed write_all. Now writes are content-
+    // complete BEFORE they become visible at the cache path:
+    //   1. write UUID to temp + sync_all (durable on disk)
+    //   2. hard_link(temp, cache) — atomic; AlreadyExists if another
+    //      caller already linked their UUID
+    //   3. delete temp regardless (it has the same inode as cache or
+    //      is orphaned if we lost)
     use std::io::Write;
     let new_id = uuid::Uuid::new_v4().to_string();
     let line = format!("{new_id}\n");
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&cache)
+    let temp_suffix = format!("tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+    let temp = cache.with_extension(temp_suffix);
+    let temp_cleanup = || {
+        let _ = fs::remove_file(&temp);
+    };
     {
-        Ok(mut f) => {
-            f.write_all(line.as_bytes()).with_context(|| {
-                format!(
-                    "failed to write new workspace id to {} — set NLR_WORKSPACE_ID explicitly",
-                    cache.display()
-                )
-            })?;
+        let mut f = std::fs::File::create(&temp).with_context(|| {
+            format!(
+                "failed to create temp workspace id at {} — set NLR_WORKSPACE_ID explicitly or fix path writability",
+                temp.display()
+            )
+        })?;
+        if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.sync_all()) {
+            temp_cleanup();
+            return Err(anyhow::Error::from(e).context(format!(
+                "failed to write/sync workspace id to {}",
+                temp.display()
+            )));
+        }
+    }
+    match std::fs::hard_link(&temp, &cache) {
+        Ok(()) => {
+            temp_cleanup();
             Ok(new_id)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Gate-36 BBB1: another caller won the race. The file
-            // exists but they may not have flushed the UUID yet
-            // (create_new is atomic; write_all is not). Retry-read
-            // with backoff up to ~500 ms total before giving up.
-            let start = std::time::Instant::now();
-            let timeout = std::time::Duration::from_millis(500);
-            let mut backoff_ms: u64 = 5;
-            loop {
-                if let Ok(persisted) = fs::read_to_string(&cache) {
-                    let trimmed = persisted.trim();
-                    if !trimmed.is_empty() {
-                        return Ok(trimmed.to_string());
-                    }
-                }
-                if start.elapsed() >= timeout {
-                    anyhow::bail!(
-                        "workspace id file {} exists but is empty after {:?} \
-                         (concurrent create may have stalled or failed)",
-                        cache.display(),
-                        timeout
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-                backoff_ms = (backoff_ms * 2).min(50);
+            // Another caller landed first. Their write was content-
+            // complete before they linked, so the file is guaranteed
+            // non-empty.
+            temp_cleanup();
+            let persisted = fs::read_to_string(&cache).with_context(|| {
+                format!("workspace id file {} exists but unreadable", cache.display())
+            })?;
+            let trimmed = persisted.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "workspace id file {} exists but is empty — likely from a pre-Gate-37 install; \
+                     delete the empty file and re-run, or set NLR_WORKSPACE_ID explicitly",
+                    cache.display()
+                );
             }
+            Ok(trimmed.to_string())
         }
-        Err(e) => Err(anyhow::Error::from(e).context(format!(
-            "failed to create workspace id file at {} — set NLR_WORKSPACE_ID explicitly or fix path writability",
-            cache.display()
-        ))),
+        Err(e) => {
+            temp_cleanup();
+            Err(anyhow::Error::from(e).context(format!(
+                "failed to link workspace id into {}",
+                cache.display()
+            )))
+        }
     }
 }
 
@@ -436,27 +454,30 @@ pub async fn search_wiki(
         "limit": limit,
         "with_payload": true
     });
-    let mut resolved_id: Option<String> = None;
-    if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
-        if !env_id.trim().is_empty() {
-            resolved_id = Some(env_id.trim().to_string());
+    // Gate-37 CCC2: resolve workspace_id ONCE per process. Prior
+    // code re-resolved on every query, so a mid-process change to
+    // NLR_ROOT or ~/.claude/state/nlr_root could shift the tenant
+    // filter while BM25/file access continued on the original repo.
+    // OnceLock<Option<String>> caches the first successful (or
+    // unsuccessful) resolution for the process lifetime; restart
+    // is required to pick up a new workspace.
+    let resolved_id = SEARCH_WORKSPACE_ID.get_or_init(|| {
+        if let Ok(env_id) = std::env::var("NLR_WORKSPACE_ID") {
+            if !env_id.trim().is_empty() {
+                return Some(env_id.trim().to_string());
+            }
         }
-    }
-    if resolved_id.is_none() {
-        // Gate-36 BBB2: use the same root-resolution path the MCP
-        // server uses (env → ~/.claude/state/nlr_root → cwd marker
-        // file). Prior code only looked at NLR_ROOT env and hard-failed
-        // on valid startup modes that resolve via state-file or cwd.
         if let Ok(nlr_root) = crate::config::resolve_nlr_root() {
             let cache = nlr_root.join(".nlr-workspace-id");
             if let Ok(persisted) = fs::read_to_string(&cache) {
                 let id = persisted.trim();
                 if !id.is_empty() {
-                    resolved_id = Some(id.to_string());
+                    return Some(id.to_string());
                 }
             }
         }
-    }
+        None
+    }).clone();
     if let Some(id) = resolved_id {
         search_body["filter"] = serde_json::json!({
             "must": [{
