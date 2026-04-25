@@ -21,27 +21,49 @@ fi
 cp "$CLAUDE_JSON" "$CLAUDE_JSON.bak.$(date +%s)"
 
 # Build the three server entries
-# Gate-61 AAAA1: package builders emit the binary at platform-specific
-# paths (target/aarch64-apple-darwin/release on macOS, target/x86_64-
-# unknown-linux-gnu/release on Linux) rather than the generic
-# server/target/release/neuro-link path. Probe candidate locations and
-# pick the first that exists. NLR_BIN= override always wins.
+# Gate-62 BBBB1+BBBB2: probe triple-specific build outputs FIRST
+# (matches what `make pkg` actually produces), then Linux package
+# staging dirs (dist/staging-linux-*), then the generic local-cargo
+# path as a true last-resort fallback. NLR_BIN= override always wins.
+# Bias toward host arch: aarch64 candidates first on arm64 hosts,
+# x86_64 first on x86 — newest matching artifact wins, stale generic
+# never preempts a fresh triple-specific build.
 if [[ -z "${NLR_BIN:-}" ]]; then
-  for candidate in \
-    "$REPO_ROOT/server/target/release/neuro-link" \
-    "$REPO_ROOT/server/target/aarch64-apple-darwin/release/neuro-link" \
-    "$REPO_ROOT/server/target/x86_64-apple-darwin/release/neuro-link" \
-    "$REPO_ROOT/server/target/x86_64-unknown-linux-gnu/release/neuro-link" \
-    "$REPO_ROOT/server/target/aarch64-unknown-linux-gnu/release/neuro-link"; do
+  HOST_ARCH=$(uname -m)
+  HOST_OS=$(uname -s)
+  CANDIDATES=()
+  case "$HOST_OS:$HOST_ARCH" in
+    Darwin:arm64)
+      CANDIDATES+=("$REPO_ROOT/server/target/aarch64-apple-darwin/release/neuro-link")
+      CANDIDATES+=("$REPO_ROOT/server/target/x86_64-apple-darwin/release/neuro-link")
+      ;;
+    Darwin:x86_64)
+      CANDIDATES+=("$REPO_ROOT/server/target/x86_64-apple-darwin/release/neuro-link")
+      CANDIDATES+=("$REPO_ROOT/server/target/aarch64-apple-darwin/release/neuro-link")
+      ;;
+    Linux:x86_64|Linux:amd64)
+      CANDIDATES+=("$REPO_ROOT/server/target/x86_64-unknown-linux-gnu/release/neuro-link")
+      CANDIDATES+=("$REPO_ROOT/dist/staging-linux-x86_64/server/neuro-link")
+      CANDIDATES+=("$REPO_ROOT/dist/staging-linux-x86_64/neuro-link")
+      ;;
+    Linux:aarch64|Linux:arm64)
+      CANDIDATES+=("$REPO_ROOT/server/target/aarch64-unknown-linux-gnu/release/neuro-link")
+      CANDIDATES+=("$REPO_ROOT/dist/staging-linux-aarch64/server/neuro-link")
+      CANDIDATES+=("$REPO_ROOT/dist/staging-linux-aarch64/neuro-link")
+      ;;
+  esac
+  # Generic local-cargo path is the last fallback (rather than the
+  # first); a fresh triple-specific build wins over a stale generic.
+  CANDIDATES+=("$REPO_ROOT/server/target/release/neuro-link")
+  for candidate in "${CANDIDATES[@]}"; do
     if [[ -x "$candidate" ]]; then
       NLR_BIN="$candidate"
       break
     fi
   done
-  # Fall back to the generic path even if missing — the installer's
-  # post-install validation (verify.py + install-mirror.sh) will surface
-  # the broken binary instead of silently registering a path that points
-  # nowhere AND skipping validation.
+  # If nothing exists, register the triple-specific generic path so
+  # post-install validation (verify.py + install-mirror.sh) reports a
+  # missing binary instead of silently passing.
   NLR_BIN="${NLR_BIN:-$REPO_ROOT/server/target/release/neuro-link}"
 fi
 TV_BIN="${TV_BIN:-$HOME/.cargo/bin/turbovault}"
