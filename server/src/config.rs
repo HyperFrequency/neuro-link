@@ -292,12 +292,20 @@ pub fn extract_frontmatter(raw: &str) -> Option<String> {
     let normalized = raw.strip_prefix('\u{FEFF}').unwrap_or(raw).replace("\r\n", "\n");
     let mut idx = 0usize;
     for line in normalized.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches('\n').trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        let no_nl = line.trim_end_matches('\n');
+        let trimmed_full = no_nl.trim();
+        if trimmed_full.is_empty() || trimmed_full.starts_with('#') {
             idx += line.len();
             continue;
         }
-        if trimmed != "---" {
+        // Gate-60 ZZZ2: opener must be at COLUMN 0 (no leading
+        // whitespace) — symmetric with the closer. Indented `  ---`
+        // at the top of a config used to be accepted, activating a
+        // policy block that should have been rejected.
+        if no_nl.starts_with(|c: char| c.is_whitespace()) {
+            return None;
+        }
+        if no_nl.trim_end() != "---" {
             return None;
         }
         idx += line.len();
@@ -332,20 +340,46 @@ pub fn extract_frontmatter(raw: &str) -> Option<String> {
 
 
 pub fn parse_frontmatter(path: &Path) -> Result<HashMap<String, String>> {
-    // Gate-59 YYY1: route through the shared extractor instead of a
-    // separate regex. Both access-control and admin/CLI now agree on
-    // what counts as "valid frontmatter".
+    // Gate-59 YYY1 + Gate-60 ZZZ1: route through the shared extractor
+    // AND deserialize with serde_yaml so admin/CLI tooling sees the
+    // same effective shapes that access control enforces. Sequence
+    // values (block or flow) get rendered as JSON-ish strings so the
+    // CLI shows the actual list rather than dropping the key
+    // entirely (which used to make `nlr_config_read` hide the
+    // allowed_paths the server was actually enforcing).
     let content = std::fs::read_to_string(path)?;
     let yaml_str = extract_frontmatter(&content).context("No frontmatter found")?;
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml_str)
+        .context("malformed YAML frontmatter")?;
     let mut map = HashMap::new();
-    for line in yaml_str.lines() {
-        if let Some((key, val)) = line.split_once(':') {
-            let k = key.trim().to_string();
-            let v = val.trim().trim_matches('"').to_string();
-            if !k.is_empty() && !v.is_empty() { map.insert(k, v); }
+    if let serde_yaml::Value::Mapping(m) = parsed {
+        for (k, v) in m {
+            let key = match k {
+                serde_yaml::Value::String(s) => s,
+                other => format!("{other:?}"),
+            };
+            let val = render_yaml_value(&v);
+            if !key.is_empty() && !val.is_empty() {
+                map.insert(key, val);
+            }
         }
     }
     Ok(map)
+}
+
+fn render_yaml_value(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::Sequence(items) => {
+            let parts: Vec<String> = items.iter().map(render_yaml_value).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        serde_yaml::Value::Mapping(_) => serde_yaml::to_string(v).unwrap_or_default().trim().to_string(),
+        serde_yaml::Value::Null => String::new(),
+        serde_yaml::Value::Tagged(t) => render_yaml_value(&t.value),
+    }
 }
 
 #[cfg(test)]
