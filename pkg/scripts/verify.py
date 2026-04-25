@@ -239,9 +239,25 @@ def check_mcp_servers() -> dict[str, Any]:
                     code = resp.status
             except urllib.error.HTTPError as e:
                 # 3xx (redirect) lands here because we disabled following.
-                # Any 3xx/4xx/5xx is a fail for required servers.
+                # Read the body and try to surface a JSON-RPC error message
+                # when the upstream returns a structured error with a
+                # non-2xx status (Gate-19 LL2 fix — prior code discarded
+                # the body and only logged the status code).
                 code = e.code
-                unreachable_required.append(f"{srv}(HTTP {code})")
+                err_msg: str | None = None
+                try:
+                    err_body = e.read(8192).decode("utf-8", errors="replace")
+                    err_payload = json.loads(err_body) if err_body.strip().startswith("{") else None
+                    if isinstance(err_payload, dict):
+                        err_obj = err_payload.get("error")
+                        if isinstance(err_obj, dict):
+                            err_msg = str(err_obj.get("message", ""))[:80]
+                except Exception:
+                    pass
+                if err_msg:
+                    unreachable_required.append(f"{srv}(HTTP {code}: {err_msg})")
+                else:
+                    unreachable_required.append(f"{srv}(HTTP {code})")
                 continue
             except Exception as e:
                 unreachable_required.append(f"{srv}({type(e).__name__})")
@@ -289,12 +305,20 @@ def check_mcp_servers() -> dict[str, Any]:
             if not isinstance(result, dict):
                 unreachable_required.append(f"{srv}(missing initialize.result object)")
                 continue
-            if "protocolVersion" not in result or "serverInfo" not in result:
-                missing_fields = [
-                    f for f in ("protocolVersion", "serverInfo") if f not in result
-                ]
+            # Gate-19 LL1: enforce TYPES, not just key presence.
+            # protocolVersion must be a non-empty string; serverInfo
+            # must be an object (presence-only let `protocolVersion:
+            # null` or `serverInfo: "x"` slip past).
+            pv = result.get("protocolVersion")
+            si = result.get("serverInfo")
+            shape_problems: list[str] = []
+            if not isinstance(pv, str) or not pv:
+                shape_problems.append("protocolVersion not a non-empty string")
+            if not isinstance(si, dict):
+                shape_problems.append("serverInfo not an object")
+            if shape_problems:
                 unreachable_required.append(
-                    f"{srv}(initialize.result missing: {','.join(missing_fields)})"
+                    f"{srv}(initialize.result shape: {'; '.join(shape_problems)})"
                 )
     if unreachable_required:
         return _fail(
