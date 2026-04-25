@@ -17,7 +17,18 @@ else
   exit 0  # not configured — skip silently
 fi
 
-KB_MAIN="${NLR_ROOT}/02-KB-main"
+# Gate-42 HHH2: walk the same vault root precedence as embed_wiki +
+# resources/list + BM25 (vaults/ canonical, 02-KB-main/ legacy). Prior
+# code only scanned 02-KB-main/, so a fresh install with content under
+# vaults/ silently produced zero RAG hits — no error, just degraded
+# retrieval quality.
+KB_ROOTS=()
+for v in vaults 02-KB-main; do
+  if [[ -d "${NLR_ROOT}/${v}" ]]; then
+    KB_ROOTS+=("${NLR_ROOT}/${v}")
+  fi
+done
+KB_MAIN="${KB_ROOTS[0]:-${NLR_ROOT}/02-KB-main}"
 RAG_INDEX="${NLR_ROOT}/state/auto-rag-index.json"
 
 # Read prompt from stdin JSON
@@ -100,40 +111,50 @@ EOF
 fi
 
 # Strategy 2: Fallback — grep wiki page titles against prompt keywords
-if [[ -d "$KB_MAIN" ]]; then
+# Gate-42 HHH2: walk every detected vault root (vaults/ first per
+# migration policy), dedupe by relative path so a vaults/ hit takes
+# precedence over a 02-KB-main/ duplicate.
+if (( ${#KB_ROOTS[@]} > 0 )); then
+  KB_ROOTS_STR="$(printf '%s\n' "${KB_ROOTS[@]}")"
   matches="$(python3 -c "
-import os, sys, re
+import os, sys
 
 prompt = sys.argv[1].lower()
-kb = '$KB_MAIN'
+roots = [r for r in '''$KB_ROOTS_STR'''.strip().split('\n') if r.strip()]
 skip = {'schema.md', 'index.md', 'log.md'}
+seen_rel = set()
 hits = []
 
-for root, dirs, files in os.walk(kb):
-    for f in files:
-        if f in skip or not f.endswith('.md'):
-            continue
-        # Match filename (kebab-case) against prompt
-        name = f.replace('.md', '').replace('-', ' ')
-        words = name.split()
-        if any(w in prompt for w in words if len(w) > 3):
-            path = os.path.join(root, f)
-            # Read first 10 lines for overview
-            with open(path) as fh:
-                lines = []
-                in_frontmatter = False
-                for line in fh:
-                    if line.strip() == '---':
-                        in_frontmatter = not in_frontmatter
-                        continue
-                    if not in_frontmatter and line.strip():
-                        lines.append(line.strip())
-                    if len(lines) >= 5:
-                        break
-            overview = ' '.join(lines)[:300]
-            hits.append(f'[{name}] {overview}')
-            if len(hits) >= 3:
-                break
+for kb in roots:
+    for root, dirs, files in os.walk(kb):
+        for f in files:
+            if f in skip or not f.endswith('.md'):
+                continue
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, kb)
+            if rel in seen_rel:
+                continue
+            name = f.replace('.md', '').replace('-', ' ')
+            words = name.split()
+            if any(w in prompt for w in words if len(w) > 3):
+                seen_rel.add(rel)
+                with open(full) as fh:
+                    lines = []
+                    in_frontmatter = False
+                    for line in fh:
+                        if line.strip() == '---':
+                            in_frontmatter = not in_frontmatter
+                            continue
+                        if not in_frontmatter and line.strip():
+                            lines.append(line.strip())
+                        if len(lines) >= 5:
+                            break
+                overview = ' '.join(lines)[:300]
+                hits.append(f'[{name}] {overview}')
+                if len(hits) >= 3:
+                    break
+        if len(hits) >= 3:
+            break
     if len(hits) >= 3:
         break
 

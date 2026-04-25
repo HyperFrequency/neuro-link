@@ -346,7 +346,15 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
             if seen_rels.contains(&rel) {
                 continue;  // already SUCCESSFULLY upserted from an earlier root
             }
-            let content = fs::read_to_string(path).unwrap_or_default();
+            // Gate-42 HHH1: mirror BM25 GGG2 fix — skip unreadable/
+            // empty pages BEFORE embedding. unwrap_or_default sent ""
+            // to the embedder which returned a non-empty zero-ish
+            // vector; the upsert succeeded and seen_rels was marked,
+            // shadowing the healthy 02-KB-main fallback.
+            let content = match fs::read_to_string(path) {
+                Ok(c) if !c.trim().is_empty() => c,
+                _ => continue,
+            };
 
             let embed_resp = client
                 .post(&embedding_url)
