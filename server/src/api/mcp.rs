@@ -175,18 +175,21 @@ pub async fn handle_mcp(
                     id, -32602, "Invalid path: traversal not allowed".into(),
                 )).unwrap_or(json!(null)));
             }
-            // Allowlist check uses the underlying vault path for the
-            // wiki form so a customized allowed_paths still gates.
+            // Gate-48 NNN1: allowlist authorization for wiki URIs
+            // probes EVERY vault root, not just the canonical
+            // vaults/ — earlier code hardcoded vaults/{rel} so a
+            // legacy-only install (allowed_paths: 02-KB-main) listed
+            // `nlr://wiki/*` URIs that read couldn't authorize.
+            // Allow if any vault dir + this rel_path is permitted.
             let vault_dirs = crate::embed::DEFAULT_VAULT_DIRS;
-            let probe_path: String = if is_wiki_uri {
-                // For allowlist purposes, treat as the canonical vaults/
-                // path; if that's not allowed, the actual fallback loop
-                // below will further restrict to allowed roots only.
-                format!("{}/{rel_path}", vault_dirs[0])
+            let allowed_to_serve: bool = if is_wiki_uri {
+                vault_dirs.iter().any(|v| {
+                    crate::config::is_path_allowed(root, &format!("{v}/{rel_path}"))
+                })
             } else {
-                rel_path.to_string()
+                crate::config::is_path_allowed(root, rel_path)
             };
-            if !crate::config::is_path_allowed(root, &probe_path) {
+            if !allowed_to_serve {
                 return Json(serde_json::to_value(JsonRpcResponse::error(
                     id, -32602, "Access denied: path not in allowed_paths".into(),
                 )).unwrap_or(json!(null)));
