@@ -83,18 +83,56 @@ pub async fn handle_mcp(
             }
         }
         "resources/list" => {
+            // Gate-46 LLL1: vault dirs (vaults/ + 02-KB-main/) get
+            // cross-vault dedup + non-empty filter — same logic the
+            // stdio transport in main.rs applies (gate-45 KKK1).
+            // Non-vault allowed paths (00-raw, 01-sorted, etc.) still
+            // get listed broadly as before.
             let allowed = crate::config::allowed_paths(root);
             let skip = ["schema.md", "index.md", "log.md"];
+            let vault_set: std::collections::HashSet<&str> =
+                crate::embed::DEFAULT_VAULT_DIRS.iter().copied().collect();
             let mut resources = Vec::new();
-            for dir_name in &allowed {
+            let mut vault_seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // Iterate allowed in declared order; vault entries are
+            // visited in the canonical vault precedence (vaults first
+            // when present in allowed_paths).
+            let mut allowed_sorted = allowed.clone();
+            allowed_sorted.sort_by_key(|d| {
+                if vault_set.contains(d.as_str()) {
+                    crate::embed::DEFAULT_VAULT_DIRS
+                        .iter()
+                        .position(|v| *v == d.as_str())
+                        .unwrap_or(usize::MAX)
+                } else {
+                    usize::MAX
+                }
+            });
+            for dir_name in &allowed_sorted {
                 let dir = root.join(dir_name);
                 if !dir.is_dir() { continue; }
+                let is_vault = vault_set.contains(dir_name.as_str());
                 for entry in WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if path.is_file()
                         && path.extension().is_some_and(|e| e == "md")
                         && !skip.iter().any(|s| path.file_name().is_some_and(|f| f == *s))
                     {
+                        if is_vault {
+                            let vault_rel = path
+                                .strip_prefix(&dir)
+                                .unwrap_or(path)
+                                .display()
+                                .to_string();
+                            if vault_seen.contains(&vault_rel) { continue; }
+                            // Skip blank vault files so legacy fallback can win
+                            let is_non_empty = std::fs::read_to_string(path)
+                                .map(|c| !c.trim().is_empty())
+                                .unwrap_or(false);
+                            if !is_non_empty { continue; }
+                            vault_seen.insert(vault_rel);
+                        }
                         let rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
                         resources.push(json!({
                             "uri": format!("nlr://{rel}"),
@@ -124,27 +162,49 @@ pub async fn handle_mcp(
                     id, -32602, "Access denied: path not in allowed_paths".into(),
                 )).unwrap_or(json!(null)));
             }
-            let full_path = root.join(rel_path);
-            // Canonicalize and verify resolved path is under root
-            let canonical = match full_path.canonicalize() {
-                Ok(p) => p,
-                Err(e) => {
-                    return Json(serde_json::to_value(JsonRpcResponse::error(
-                        id, -32602, format!("Resource not found: {e}"),
-                    )).unwrap_or(json!(null)));
-                }
-            };
+            // Gate-46 LLL1: vault-aware fallback. If rel_path is under
+            // a vault root (vaults/... or 02-KB-main/...) and the
+            // requested file is missing OR blank, try the same vault-
+            // relative path under the OTHER vault root in priority
+            // order. Mirrors the stdio handler's vault precedence.
             let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-            if !canonical.starts_with(&root_canonical) {
-                return Json(serde_json::to_value(JsonRpcResponse::error(
-                    id, -32602, "Access denied: path outside data root".into(),
-                )).unwrap_or(json!(null)));
+            let vault_dirs = crate::embed::DEFAULT_VAULT_DIRS;
+            let vault_rel: Option<&str> = vault_dirs
+                .iter()
+                .find_map(|v| {
+                    let p = format!("{}/", v);
+                    rel_path.strip_prefix(&p)
+                });
+            let candidates: Vec<std::path::PathBuf> = if let Some(vrel) = vault_rel {
+                vault_dirs
+                    .iter()
+                    .map(|v| root.join(v).join(vrel))
+                    .collect()
+            } else {
+                vec![root.join(rel_path)]
+            };
+            let mut chosen: Option<(std::path::PathBuf, String)> = None;
+            for candidate in candidates {
+                let canonical = match candidate.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if !canonical.starts_with(&root_canonical) {
+                    continue;
+                }
+                match std::fs::read_to_string(&canonical) {
+                    Ok(content) if !content.trim().is_empty() => {
+                        chosen = Some((canonical, content));
+                        break;
+                    }
+                    _ => continue,
+                }
             }
-            match std::fs::read_to_string(&canonical) {
-                Ok(content) => JsonRpcResponse::success(id, json!({
+            match chosen {
+                Some((_canonical, content)) => JsonRpcResponse::success(id, json!({
                     "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": content }]
                 })),
-                Err(e) => JsonRpcResponse::error(id, -32602, format!("Resource not found: {e}")),
+                None => JsonRpcResponse::error(id, -32602, format!("Resource not found or empty in any vault root: {rel_path}")),
             }
         }
         "prompts/list" => {
