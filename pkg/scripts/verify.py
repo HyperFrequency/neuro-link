@@ -373,9 +373,24 @@ OPTIONAL_LLAMA_PORTS = [8402]        # qexpand (informational)
 def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
     """POST a minimal request to /v1/embeddings — must return a JSON
     object with .data[0].embedding present. Proves the listener is
-    actually configured for embeddings, not e.g. completion mode."""
+    actually configured for embeddings, not e.g. completion mode.
+    Gate-28 TT1: do NOT hardcode a model name. Resolve from
+    /v1/models if available; fall back to omitting the model field
+    entirely. Either lets a server with model-routing accept the
+    probe without false-rejecting on an unrecognized hardcoded id."""
+    body_dict: dict[str, Any] = {"input": "verify.py probe"}
     try:
-        body = json.dumps({"input": "verify.py probe", "model": "octen"}).encode()
+        with urllib.request.urlopen(
+            urllib.request.Request(f"http://127.0.0.1:{port}/v1/models"), timeout=2.0
+        ) as resp:
+            models = json.loads(resp.read(2048).decode("utf-8", errors="replace"))
+        first = (models.get("data") or [{}])[0].get("id")
+        if isinstance(first, str) and first:
+            body_dict["model"] = first
+    except Exception:
+        pass  # fall through with no .model field — many llama.cpp deploys accept that
+    try:
+        body = json.dumps(body_dict).encode()
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/v1/embeddings",
             data=body, headers={"Content-Type": "application/json"}, method="POST",
@@ -385,9 +400,15 @@ def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
         emb = (payload.get("data") or [{}])[0].get("embedding")
         if not isinstance(emb, list) or not emb:
             return False, "no .data[0].embedding in response"
-        return True, f"embedding dim={len(emb)}"
+        model_used = body_dict.get("model", "<unspecified>")
+        return True, f"embedding dim={len(emb)} model={model_used}"
     except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code}"
+        # Gate-28 TT1 also: surface response body so misrouting/auth errors are diagnosable.
+        try:
+            err_body = e.read(512).decode("utf-8", errors="replace")[:120]
+        except Exception:
+            err_body = ""
+        return False, f"HTTP {e.code}{(': ' + err_body) if err_body else ''}"
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:60]}"
 
