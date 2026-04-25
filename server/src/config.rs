@@ -117,28 +117,34 @@ pub fn allowed_paths(root: &Path) -> Vec<String> {
             break;
         }
         let body = normalized.get(idx..)?;
-        // Gate-57 WWW1: closing delimiter parsed line-by-line with the
-        // same trim() rule as the opener. Prior raw "\n---" substring
-        // search rejected `---   ` (trailing spaces) and similar
-        // whitespace variants — innocuous formatting collapsed
-        // allowed_paths to deny-all.
+        // Gate-57 WWW1 + Gate-58 XXX1: closing delimiter must be `---`
+        // at COLUMN 0 (no leading whitespace) — only trailing
+        // whitespace is tolerated. Prior trim()-both-sides rule
+        // accepted indented `  ---` inside YAML block scalars,
+        // truncating frontmatter prematurely and dropping
+        // allowed_paths back to DEFAULT.
         let mut cursor = 0usize;
         let mut end_marker_pos: Option<usize> = None;
         for line in body.split_inclusive('\n') {
-            let trimmed = line.trim_end_matches('\n').trim();
-            if trimmed == "---" {
+            let no_nl = line.trim_end_matches('\n');
+            // Reject leading whitespace; allow trailing.
+            if no_nl.starts_with(|c: char| c.is_whitespace()) {
+                cursor += line.len();
+                continue;
+            }
+            if no_nl.trim_end() == "---" {
                 end_marker_pos = Some(cursor);
                 break;
             }
             cursor += line.len();
         }
         // Allow file ending with a `---` that has no trailing newline.
-        if end_marker_pos.is_none() && body.trim_end().ends_with("---") {
-            // Find the start of the last non-empty line to anchor the cut.
-            let trimmed_body = body.trim_end();
-            let last_newline = trimmed_body.rfind('\n').map(|n| n + 1).unwrap_or(0);
-            let last_line = trimmed_body[last_newline..].trim();
-            if last_line == "---" {
+        if end_marker_pos.is_none() {
+            let last_newline = body.rfind('\n').map(|n| n + 1).unwrap_or(0);
+            let last_line = &body[last_newline..];
+            if !last_line.starts_with(|c: char| c.is_whitespace())
+                && last_line.trim_end() == "---"
+            {
                 end_marker_pos = Some(last_newline);
             }
         }
