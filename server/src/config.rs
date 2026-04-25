@@ -75,9 +75,24 @@ pub fn allowed_paths(root: &Path) -> Vec<String> {
     // (→ DENY ALL, operator policy can't be parsed). Frontmatter
     // extraction tolerates UTF-8 BOM, CRLF line endings, and leading
     // blank lines/comments before the opening ---.
+    // Gate-56 VVV1: only NotFound = "no policy expressed" → DEFAULT.
+    // Permission denied / transient I/O / etc. = file is THERE but
+    // can't be read → fail closed (deny all). Re-broadening to DEFAULT
+    // on EACCES would silently expand permissions exactly when the
+    // policy file is unhealthy.
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
-        Err(_) => return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return DEFAULT_ALLOWED_PATHS.iter().map(|s| s.to_string()).collect();
+        }
+        Err(e) => {
+            eprintln!(
+                "[config] WARN: cannot read {} ({}); failing closed (deny all)",
+                config_path.display(),
+                e
+            );
+            return Vec::new();
+        }
     };
     // Strip BOM and normalize CRLF for the rest of the parser.
     let normalized = content
@@ -160,14 +175,37 @@ pub fn allowed_paths(root: &Path) -> Vec<String> {
                 .filter(|s| !s.is_empty())
                 .collect()
         }
-        serde_yaml::Value::Sequence(items) => items
-            .iter()
-            .filter_map(|v| match v {
-                serde_yaml::Value::String(s) => Some(s.trim().to_string()),
-                _ => None,
-            })
-            .filter(|s| !s.is_empty())
-            .collect(),
+        serde_yaml::Value::Sequence(items) => {
+            // Gate-56 VVV2: validate EVERY element is a non-empty
+            // string before returning any. A mixed-type list like
+            // `[vaults, 1]` previously dropped the int and admitted
+            // `vaults` — silent partial-allow. Now: reject the whole
+            // list with a specific warn-log and deny all.
+            let mut out: Vec<String> = Vec::with_capacity(items.len());
+            for (i, v) in items.iter().enumerate() {
+                match v {
+                    serde_yaml::Value::String(s) if !s.trim().is_empty() => {
+                        out.push(s.trim().to_string());
+                    }
+                    serde_yaml::Value::String(_) => {
+                        eprintln!(
+                            "[config] WARN: allowed_paths[{i}] in {} is an empty string; failing closed (deny all)",
+                            config_path.display()
+                        );
+                        return Vec::new();
+                    }
+                    other => {
+                        eprintln!(
+                            "[config] WARN: allowed_paths[{i}] in {} has unsupported type ({:?}); failing closed (deny all)",
+                            config_path.display(),
+                            other
+                        );
+                        return Vec::new();
+                    }
+                }
+            }
+            out
+        }
         _ => {
             eprintln!(
                 "[config] WARN: allowed_paths in {} has unsupported value type; failing closed (deny all)",
