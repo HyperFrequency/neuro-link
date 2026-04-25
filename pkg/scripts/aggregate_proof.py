@@ -107,6 +107,14 @@ def main(proof_dir: str) -> int:
             # Honest deferred per fork-F2 — breaks strict green but not
             # green_excluding_skipped. A cred'd re-run flips these to ready.
             all_green = False
+        elif state == "incomplete":
+            # Gate-24 PP1: verify.py emitted this when skips > 0
+            # (voluntary NLR_VERIFY_SKIP or OFFLINE). For INSTALL_COMPLETE
+            # this means a partial run that must NOT count as a ship
+            # gate pass — fails BOTH green and green_excluding_skipped.
+            # For any other target this is also treated as degraded.
+            all_green = False
+            all_green_excl_skipped = False
         elif state == "ready":
             # Gate-20 MM3 + Gate-21 NN2: different ready-state integrity
             # contracts for different target classes.

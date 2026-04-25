@@ -82,29 +82,39 @@ dashboards:
 # `make proof` runs inside the package builder before any rag stack
 # is up; full-stack reachability is left to `proof-full` in the
 # parent Makefile.
-proof: PROOF_OFFLINE := 1
-proof: PROOF_SKIP := qmd,multilspy,pyright,vaults
-# Gate-20 MM4: proof-full is the comprehensive ship gate that enforces
-# EVERY completeness check. Run after `make rag-up` + ingestion + the
-# dev-tool install (pipx install pyright multilspy qmd) has actually
-# provisioned qmd/multilspy/pyright/vaults. Without MM4 the pkg
-# Makefile advertised install-completeness gating but permanently
-# skipped four verifier checks, with no in-repo path to ever enforce
-# them.
-proof-full: PROOF_OFFLINE := 0
-proof-full: PROOF_SKIP :=
-
-proof proof-full:
-	# Gate-21 NN1: verify.py runs FIRST so the fresh
-	# INSTALL_COMPLETE.ready.json is on disk before aggregate_proof.py
-	# discovers it. Prior order (aggregate first, verify after) meant
-	# clean runs missed the meta-proof entirely, and retries could
-	# aggregate a stale INSTALL_COMPLETE before the current verify
-	# overwrote it. Also delete any stale file up front so retries
-	# can't leak an outdated success into the aggregate.
+# Gate-24 PP1: proof vs proof-full split by SCOPE, not skip-mask.
+#   - `make proof` (called by `make all`): ONLY aggregates per-target
+#     builder proofs (macos / linux-* / docker / cloud-*) into
+#     ALL.ready.json. Does NOT invoke verify.py. Does NOT write
+#     INSTALL_COMPLETE.ready.json. Clean-clone `make all` produces a
+#     builder-bundle attestation, not an install-completeness one.
+#   - `make proof-full`: runs verify.py with NO skips (operator must
+#     have provisioned qmd/multilspy/pyright + brought rag-up + seeded
+#     vaults) — emits state="ready" INSTALL_COMPLETE.ready.json — then
+#     re-aggregates. This is the canonical install-completeness ship
+#     gate; users run it after `make rag-up` + dev-tool install.
+# Prior behavior conflated the two: `make all` emitted an
+# INSTALL_COMPLETE proof with intentional skips, and the aggregator
+# happily treated partial proofs as green_excluding_skipped. Codex
+# gate-22/23 correctly flagged that as false-green. The new contract:
+# an INSTALL_COMPLETE.ready.json on disk means verify.py had no skips
+# and no fails; anything else (incomplete/fail) is aggregator-red.
+proof:
+	# Gate-24 PP1: delete any stale INSTALL_COMPLETE from a prior
+	# proof-full so the builder-only aggregate doesn't inherit a
+	# partial or outdated completeness attestation.
 	@rm -f $(PROOF_DIR)/INSTALL_COMPLETE.ready.json
-	@echo "Running install-completeness verifier (offline=$(PROOF_OFFLINE) skip=[$(PROOF_SKIP)]):"
-	@NLR_VERIFY_OFFLINE=$(PROOF_OFFLINE) NLR_VERIFY_SKIP=$(PROOF_SKIP) \
+	@echo "Aggregating per-target builder proofs (no install-completeness in this target):"
+	@python3 pkg/scripts/aggregate_proof.py $(PROOF_DIR) > $(PROOF_DIR)/ALL.ready.json
+	@cat $(PROOF_DIR)/ALL.ready.json | python3 -m json.tool | head -40
+
+proof-full:
+	# Gate-24 PP1: comprehensive ship gate. Delete stale, run full
+	# verify.py (online, no skips), then aggregate — fails-closed if
+	# any check missing or not green.
+	@rm -f $(PROOF_DIR)/INSTALL_COMPLETE.ready.json
+	@echo "Running full install-completeness verifier (no skips, live probes):"
+	@NLR_VERIFY_OFFLINE=0 NLR_VERIFY_SKIP= \
 	    python3 pkg/scripts/verify.py > $(PROOF_DIR)/INSTALL_COMPLETE.ready.json \
 	  && cat $(PROOF_DIR)/INSTALL_COMPLETE.ready.json | python3 -m json.tool | head -30 \
 	  || (echo "ERROR: verify.py reported install-completeness failure (see above)"; exit 1)

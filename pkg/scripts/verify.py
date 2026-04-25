@@ -639,21 +639,20 @@ def main() -> int:
     green = fails == 0
 
     PROOF_DIR.mkdir(parents=True, exist_ok=True)
-    # Gate-20 MM2 + Gate-22 OO2: emit `state` consumed by
-    # aggregate_proof.py alongside `green` for verify.py's own callers.
-    #   - fails > 0        → "fail"       (hard red, aggregator fails closed)
-    #   - skips > 0        → "skipped_no_creds"  (partial run — e.g.
-    #                           `make all` offline pre-rag-up — aggregator
-    #                           treats like cloud-deferred: breaks strict
-    #                           green but keeps green_excluding_skipped)
+    # Gate-20 MM2 + Gate-22 OO2 + Gate-24 PP2: state vocabulary for
+    # aggregate_proof.py. "incomplete" is distinct from
+    # "skipped_no_creds" — the former flags a voluntarily partial
+    # verifier run (NLR_VERIFY_SKIP=... or OFFLINE=1) that must NOT
+    # pass any ship gate; the latter is reserved for cloud-credential
+    # deferrals that aggregator accepts for green_excluding_skipped.
+    #   - fails > 0        → "fail"       (hard red)
+    #   - skips > 0        → "incomplete" (aggregator fails closed
+    #                           on this state; see PP1 carveout)
     #   - else (all pass)  → "ready"      (full green)
-    # This prevents `make all`'s intentionally-offline proof from
-    # masquerading as a full install-completeness attestation: only a
-    # `make proof-full` run with no skips emits state="ready".
     if fails > 0:
         state = "fail"
     elif skips > 0:
-        state = "skipped_no_creds"
+        state = "incomplete"
     else:
         state = "ready"
     out = {
