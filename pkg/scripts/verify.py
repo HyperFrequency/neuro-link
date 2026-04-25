@@ -828,7 +828,15 @@ def main() -> int:
         print(line, file=sys.stderr)
     print(f"Proof: {proof_path}", file=sys.stderr)
 
-    return 0 if green else 1
+    # Gate-63 CCCC1: exit 0 when there are zero hard fails — including
+    # the "incomplete" state from intentional skips. The state field
+    # still signals ready/incomplete/fail to downstream tooling for
+    # ship-vs-partial decisions; the exit code reflects whether any
+    # check that actually RAN failed. Without this, pre-proof (which
+    # legitimately uses NLR_VERIFY_SKIP for build-only verification
+    # before mcp+hooks land) would always exit 1 and abort `make all`
+    # before the global-state mutations could even start.
+    return 0 if fails == 0 else 1
 
 
 if __name__ == "__main__":

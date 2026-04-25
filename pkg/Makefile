@@ -16,6 +16,13 @@
 
 .PHONY: all local mac-only macos linux linux-x86_64 linux-aarch64 docker cloud cloud-modal cloud-lambda cloud-ray models dashboards proof proof-full clean
 
+# Gate-9 CCCC2: serialize the package build flow. Recursive $(MAKE)
+# from the parent inherits parallelism via MAKEFLAGS; without this,
+# `proof` could run before all builder targets (macos, linux-*,
+# docker) finished and aggregate stale or absent .ready.json files.
+# Mirrors the parent Makefile's .NOTPARALLEL guard.
+.NOTPARALLEL:
+
 VERSION ?= $(shell git describe --tags --always --dirty)
 ROOT := $(shell git rev-parse --show-toplevel)
 PROOF_DIR := $(ROOT)/pkg/.proof
