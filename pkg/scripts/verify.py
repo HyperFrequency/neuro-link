@@ -375,14 +375,16 @@ def check_llama_servers() -> dict[str, Any]:
         ok, _ = _http_ok(f"http://127.0.0.1:{port}/v1/models", timeout=2.0)
         (reachable if ok else down).append(port)
     if not reachable:
-        # Non-fatal but loud — user may have them intentionally stopped.
-        return {
-            "name": "llama-servers",
-            "status": "warn",
-            "reason": f"no warm llama-servers reachable on {WARM_LLAMA_PORTS}; expected at least 1",
-            "reachable": reachable,
-            "down": down,
-        }
+        # Gate-25 QQ2: promoted from warn to fail. `proof-full`
+        # explicitly runs with OFFLINE=0 and skips=[] — it is the
+        # live-stack audit, so zero reachable llama servers is a
+        # genuine red for completeness. If the user wants to skip the
+        # whole block, NLR_VERIFY_OFFLINE=1 or NLR_VERIFY_SKIP=llama-
+        # servers still short-circuits (returns _skipped above).
+        return _fail(
+            "llama-servers",
+            f"no warm llama-servers reachable on {WARM_LLAMA_PORTS}; expected at least 1",
+        )
     return {
         "name": "llama-servers",
         "status": "pass",
@@ -522,15 +524,15 @@ def _resolve_serena_bin() -> tuple[Path | None, str]:
 def check_serena_arch() -> dict[str, Any]:
     if "serena-arch" in SKIP:
         return _skipped("serena-arch", "NLR_VERIFY_SKIP")
-    # Gate-11 CC3 + Gate-13 FF1: serena is an OPTIONAL MCP — matching
-    # install-mirror.sh BB1's contract. If the key isn't registered,
-    # skip. If the key IS registered but the binary can't be resolved
-    # (stale entry from a prior uninstall, wrong path, etc.), ALSO skip
-    # with a warn note — install-mirror.sh treats that case as "warn
-    # only" for optional servers, so the gate must match or retries on
-    # non-pristine hosts go red even when the installer said OK.
-    # Returning _skipped (not _fail) keeps the optional contract intact
-    # while surfacing the stale entry in the gate note.
+    # Gate-25 QQ1: serena is OPTIONAL per install-mirror.sh BB1.
+    # Optional auto-absence/auto-unresolvable returns "warn" (NOT
+    # "skipped"). Skipped triggers state=incomplete in the new gate
+    # vocabulary, which would make proof-full hard-fail any clean
+    # install that legitimately omitted serena. Warn keeps the gate
+    # green-able while still surfacing the missing optional in the
+    # checks list. Explicit user opt-out via NLR_VERIFY_SKIP still
+    # returns _skipped (above) — that's a deliberate choice, not an
+    # auto-absent.
     claude_json = HOME / ".claude.json"
     if claude_json.is_file():
         try:
@@ -538,10 +540,10 @@ def check_serena_arch() -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             cfg = {}
         if "serena" not in (cfg.get("mcpServers") or {}):
-            return _skipped("serena-arch", "serena not registered (optional MCP)")
+            return {"name": "serena-arch", "status": "warn", "note": "serena not registered (optional MCP)"}
     serena_bin, why = _resolve_serena_bin()
     if serena_bin is None:
-        return _skipped("serena-arch", f"optional serena unresolvable: {why}")
+        return {"name": "serena-arch", "status": "warn", "note": f"optional serena unresolvable: {why}"}
 
     # ~/.local/bin/serena-hooks is usually a pip wrapper script — running
     # file(1) directly tells you "ASCII text". Resolve symlinks, then
@@ -636,25 +638,28 @@ def main() -> int:
     warns = sum(1 for s in statuses if s == "warn")
     skips = sum(1 for s in statuses if s == "skipped")
     passes = sum(1 for s in statuses if s == "pass")
-    green = fails == 0
+
+    # Gate-25 QQ3: state/green/filename/exit ALL agree.
+    #   - fails > 0       → state="fail"       file=.fail.json       green=False exit=1
+    #   - skips > 0       → state="incomplete" file=.incomplete.json green=False exit=1
+    #   - else (all pass) → state="ready"      file=.ready.json      green=True  exit=0
+    # Only a green=True / state=ready run produces INSTALL_COMPLETE.ready.json;
+    # incomplete/fail runs write to distinctly-named files so the aggregator
+    # (which globs *.ready.json) and any downstream consumer can't mistake
+    # a partial/failed run for a pass.
+    if fails > 0:
+        state, suffix = "fail", "fail"
+    elif skips > 0:
+        state, suffix = "incomplete", "incomplete"
+    else:
+        state, suffix = "ready", "ready"
+    green = state == "ready"
 
     PROOF_DIR.mkdir(parents=True, exist_ok=True)
-    # Gate-20 MM2 + Gate-22 OO2 + Gate-24 PP2: state vocabulary for
-    # aggregate_proof.py. "incomplete" is distinct from
-    # "skipped_no_creds" — the former flags a voluntarily partial
-    # verifier run (NLR_VERIFY_SKIP=... or OFFLINE=1) that must NOT
-    # pass any ship gate; the latter is reserved for cloud-credential
-    # deferrals that aggregator accepts for green_excluding_skipped.
-    #   - fails > 0        → "fail"       (hard red)
-    #   - skips > 0        → "incomplete" (aggregator fails closed
-    #                           on this state; see PP1 carveout)
-    #   - else (all pass)  → "ready"      (full green)
-    if fails > 0:
-        state = "fail"
-    elif skips > 0:
-        state = "incomplete"
-    else:
-        state = "ready"
+    # Clear any prior state files so file presence unambiguously
+    # reflects the current run.
+    for old_suffix in ("ready", "incomplete", "fail"):
+        (PROOF_DIR / f"INSTALL_COMPLETE.{old_suffix}.json").unlink(missing_ok=True)
     out = {
         "target": "INSTALL_COMPLETE",
         "state": state,
@@ -664,11 +669,11 @@ def main() -> int:
         "summary": {"pass": passes, "fail": fails, "warn": warns, "skipped": skips},
         "checks": results,
     }
-    proof_path = PROOF_DIR / "INSTALL_COMPLETE.ready.json"
+    proof_path = PROOF_DIR / f"INSTALL_COMPLETE.{suffix}.json"
     proof_path.write_text(json.dumps(out, indent=2) + "\n")
 
     # Human-readable summary to stderr
-    print(f"INSTALL_COMPLETE: green={green} | pass={passes} fail={fails} warn={warns} skipped={skips}", file=sys.stderr)
+    print(f"INSTALL_COMPLETE: state={state} green={green} | pass={passes} fail={fails} warn={warns} skipped={skips}", file=sys.stderr)
     for r in results:
         line = f"  [{r['status']:<7}] {r['name']}"
         if r.get("note"):

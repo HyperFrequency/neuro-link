@@ -109,15 +109,18 @@ proof:
 	@cat $(PROOF_DIR)/ALL.ready.json | python3 -m json.tool | head -40
 
 proof-full:
-	# Gate-24 PP1: comprehensive ship gate. Delete stale, run full
-	# verify.py (online, no skips), then aggregate — fails-closed if
-	# any check missing or not green.
-	@rm -f $(PROOF_DIR)/INSTALL_COMPLETE.ready.json
+	# Gate-24 PP1 + Gate-25 QQ3: verify.py writes its own proof file
+	# (INSTALL_COMPLETE.{ready,incomplete,fail}.json depending on
+	# state). The Makefile no longer redirects stdout — prior
+	# `> INSTALL_COMPLETE.ready.json` would land the file under the
+	# .ready.json name even on fail state, defeating the QQ3
+	# "file presence = ready" property.
 	@echo "Running full install-completeness verifier (no skips, live probes):"
-	@NLR_VERIFY_OFFLINE=0 NLR_VERIFY_SKIP= \
-	    python3 pkg/scripts/verify.py > $(PROOF_DIR)/INSTALL_COMPLETE.ready.json \
-	  && cat $(PROOF_DIR)/INSTALL_COMPLETE.ready.json | python3 -m json.tool | head -30 \
+	@NLR_VERIFY_OFFLINE=0 NLR_VERIFY_SKIP= python3 pkg/scripts/verify.py \
 	  || (echo "ERROR: verify.py reported install-completeness failure (see above)"; exit 1)
+	@if [ -f $(PROOF_DIR)/INSTALL_COMPLETE.ready.json ]; then \
+	    cat $(PROOF_DIR)/INSTALL_COMPLETE.ready.json | python3 -m json.tool | head -30; \
+	fi
 	@echo
 	@echo "Aggregating all .ready.json proofs into ALL.ready.json:"
 	@python3 pkg/scripts/aggregate_proof.py $(PROOF_DIR) > $(PROOF_DIR)/ALL.ready.json
