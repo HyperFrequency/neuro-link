@@ -432,10 +432,14 @@ def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
     except Exception as e:
         discovery_err = f"/v1/models discovery: {type(e).__name__}: {str(e)[:60]}"
 
-    # Gate-30 VV2: bound the probe loop. Dedupe + cap at 8 candidates
-    # + total wall-clock budget of 12 seconds. Prioritize ids with
-    # "embed" in the name. Without this, a multi-model deploy with
-    # dozens of slow-rejecting ids could stall proof-full for minutes.
+    # Gate-30 VV2 + Gate-31 WW1: bound the probe by WALL-CLOCK budget,
+    # not position. Dedupe + sort embed-named first so the most likely
+    # candidate is tried first within the budget. WW1 fix: removed the
+    # MAX_CANDIDATES position cap — a valid embedding model that's
+    # late-listed and not named with "embed" was previously skipped
+    # and the gate false-failed. Now: try as many as fit in 12 seconds,
+    # ordered by name affinity. The budget itself prevents stalls on
+    # huge catalogs.
     seen: set[str] = set()
     deduped: list[str] = []
     for mid in discovered_models:
@@ -443,20 +447,17 @@ def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
             seen.add(mid)
             deduped.append(mid)
     deduped.sort(key=lambda m: 0 if "embed" in m.lower() else 1)
-    MAX_CANDIDATES = 8
     BUDGET_SEC = 12.0
-    if len(deduped) > MAX_CANDIDATES:
-        truncated_count = len(deduped) - MAX_CANDIDATES
-        deduped = deduped[:MAX_CANDIDATES]
-    else:
-        truncated_count = 0
 
     last_failure = ""
     deadline = time.monotonic() + BUDGET_SEC
+    tried = 0
+    not_tried_budget = 0
     for model_id in deduped:
         if time.monotonic() >= deadline:
-            last_failure = (last_failure + "; " if last_failure else "") + f"probe budget {BUDGET_SEC}s exhausted"
+            not_tried_budget = len(deduped) - tried
             break
+        tried += 1
         ok, note = _try_embed_with_model(port, model_id)
         if ok:
             return True, note
@@ -467,8 +468,8 @@ def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
         if ok:
             return True, note
         last_failure = note if not last_failure else f"{last_failure}; {note}"
-    if truncated_count:
-        last_failure = f"{last_failure} (skipped {truncated_count} extra ids past cap={MAX_CANDIDATES})"
+    if not_tried_budget:
+        last_failure = f"{last_failure} (probe budget {BUDGET_SEC}s exhausted with {not_tried_budget} candidate id(s) untried)"
     if discovery_err:
         last_failure = f"{discovery_err}; {last_failure}"
     return False, last_failure

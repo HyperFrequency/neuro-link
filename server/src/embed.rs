@@ -192,6 +192,14 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
     // breaking existing deployments that only have `02-KB-main/`. The
     // reverse is also true — a repo that has already moved everything to
     // `vaults/` doesn't need a placeholder `02-KB-main/`.
+    // Gate-31 WW2: dedupe by relative path across roots. The migration
+    // window allows both `vaults/` (canonical) and `02-KB-main/`
+    // (legacy) to coexist; without dedup, a file present in both
+    // (e.g. tool/x.md) gets indexed twice as distinct Qdrant points
+    // (Uuid::new_v4() per upsert), producing noisy retrieval. Walk
+    // DEFAULT_VAULT_DIRS in declared order — vaults/ first per
+    // module docs — and skip a relative path the second time.
+    let mut seen_rels: std::collections::HashSet<String> = std::collections::HashSet::new();
     for vault_name in DEFAULT_VAULT_DIRS {
         let vault_root = root.join(vault_name);
         if !vault_root.is_dir() {
@@ -205,12 +213,15 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
             {
                 continue;
             }
-            let content = fs::read_to_string(path).unwrap_or_default();
             let rel = path
                 .strip_prefix(&vault_root)
                 .unwrap_or(path)
                 .display()
                 .to_string();
+            if !seen_rels.insert(rel.clone()) {
+                continue;  // already indexed from an earlier root (vaults/ wins)
+            }
+            let content = fs::read_to_string(path).unwrap_or_default();
 
             let embed_resp = client
                 .post(&embedding_url)
@@ -239,7 +250,11 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
             // Only count upserts that Qdrant actually accepted; previously
             // the counter was bumped on any send() resolution, making
             // silent rejects invisible in the success log.
-            let point_id = uuid::Uuid::new_v4().to_string();
+            // Gate-31 WW2: deterministic UUID v5 keyed off relative path
+            // means re-embeds OVERWRITE the same Qdrant point instead of
+            // creating a new one each run (which previously left stale
+            // copies after content changes).
+            let point_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, rel.as_bytes()).to_string();
             let upsert_url = format!("{qdrant_url}/collections/{collection}/points");
             match client
                 .put(&upsert_url)
