@@ -274,8 +274,28 @@ def check_mcp_servers() -> dict[str, Any]:
             if mcp_payload.get("jsonrpc") != "2.0":
                 unreachable_required.append(f"{srv}(missing jsonrpc:2.0)")
                 continue
-            if "result" not in mcp_payload and "error" not in mcp_payload:
-                unreachable_required.append(f"{srv}(no JSON-RPC result/error)")
+            # Gate-18 KK1: require a successful MCP `initialize`
+            # response shape — `.result.protocolVersion` AND
+            # `.result.serverInfo`. A `.error` body proves nothing
+            # because any unrelated JSON-RPC server returns one for
+            # an unrecognized method; only the result shape is
+            # diagnostic of an MCP implementation answering.
+            if "error" in mcp_payload:
+                err = mcp_payload.get("error") or {}
+                err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                unreachable_required.append(f"{srv}(JSON-RPC error: {err_msg[:80]})")
+                continue
+            result = mcp_payload.get("result")
+            if not isinstance(result, dict):
+                unreachable_required.append(f"{srv}(missing initialize.result object)")
+                continue
+            if "protocolVersion" not in result or "serverInfo" not in result:
+                missing_fields = [
+                    f for f in ("protocolVersion", "serverInfo") if f not in result
+                ]
+                unreachable_required.append(
+                    f"{srv}(initialize.result missing: {','.join(missing_fields)})"
+                )
     if unreachable_required:
         return _fail(
             "mcp-servers",
