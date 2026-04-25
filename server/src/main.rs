@@ -239,11 +239,24 @@ fn handle_resources_list(id: Option<Value>, root: &std::path::Path) -> JsonRpcRe
             }
         }
     }
+    // Gate-51 QQQ1: parity with HTTP transport (gate-50 PPP1 +
+    // gate-47 MMM1) — filter to allowed vault roots and reject
+    // symlinked vault entries up front. Without these, the stdio
+    // transport still served excluded-vault content via symlinked
+    // alias and ignored allowed_paths customization.
+    let allowed = crate::config::allowed_paths(root);
+    let allowed_set: std::collections::HashSet<&str> =
+        allowed.iter().map(|s| s.as_str()).collect();
     for vault_name in crate::embed::DEFAULT_VAULT_DIRS {
-        let vault_root = root.join(vault_name);
-        if vault_root.is_dir() {
-            walk(&vault_root, &vault_root, &skip, &mut seen, &mut resources);
+        if !allowed_set.contains(vault_name) {
+            continue; // not in user's allow list
         }
+        let vault_root = root.join(vault_name);
+        if !vault_root.is_dir() { continue; }
+        if let Ok(meta) = std::fs::symlink_metadata(&vault_root) {
+            if meta.file_type().is_symlink() { continue; }
+        }
+        walk(&vault_root, &vault_root, &skip, &mut seen, &mut resources);
     }
 
     JsonRpcResponse::success(id, serde_json::json!({ "resources": resources }))
@@ -268,17 +281,31 @@ fn handle_resources_read(
         return JsonRpcResponse::error(id, -32602, "Invalid path: traversal not allowed".into());
     }
 
-    // Gate-40 FFF2 + Gate-45 KKK1: try each vault root in priority
-    // order, but only accept a candidate that has non-empty content.
-    // Without the emptiness check, a blank vaults/foo.md shadowed a
-    // populated 02-KB-main/foo.md — search hits couldn't be hydrated.
+    // Gate-40 FFF2 + Gate-45 KKK1 + Gate-51 QQQ1: try each ALLOWED
+    // vault root (filtered by allowed_paths) in priority order. Skip
+    // symlinked vault roots fail-closed (parity with HTTP transport
+    // gate-50 PPP1). Per-vault containment check protects against
+    // in-vault symlink escapes (gate-49 OOO1).
+    let allowed = crate::config::allowed_paths(root);
+    let allowed_set: std::collections::HashSet<&str> =
+        allowed.iter().map(|s| s.as_str()).collect();
     let mut canonical: Option<std::path::PathBuf> = None;
     let mut allowed_canonical: Option<std::path::PathBuf> = None;
     for vault_name in crate::embed::DEFAULT_VAULT_DIRS {
+        if !allowed_set.contains(vault_name) {
+            continue; // not in user's allow list
+        }
         let vault_root = root.join(vault_name);
+        // Reject symlinked vault root — fail-closed.
+        if let Ok(meta) = std::fs::symlink_metadata(&vault_root) {
+            if meta.file_type().is_symlink() { continue; }
+        }
         let candidate = vault_root.join(rel_path);
         if let Ok(c) = candidate.canonicalize() {
-            let vault_canonical = vault_root.canonicalize().unwrap_or(vault_root);
+            let vault_canonical = match vault_root.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             if !c.starts_with(&vault_canonical) {
                 continue;
             }
