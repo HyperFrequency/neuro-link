@@ -370,25 +370,12 @@ REQUIRED_LLAMA_PORTS = [8400, 8401]  # embed + rerank
 OPTIONAL_LLAMA_PORTS = [8402]        # qexpand (informational)
 
 
-def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
-    """POST a minimal request to /v1/embeddings — must return a JSON
-    object with .data[0].embedding present. Proves the listener is
-    actually configured for embeddings, not e.g. completion mode.
-    Gate-28 TT1: do NOT hardcode a model name. Resolve from
-    /v1/models if available; fall back to omitting the model field
-    entirely. Either lets a server with model-routing accept the
-    probe without false-rejecting on an unrecognized hardcoded id."""
+def _try_embed_with_model(port: int, model: str | None) -> tuple[bool, str]:
+    """One /v1/embeddings POST attempt. model=None omits the field
+    entirely (many single-model llama.cpp deployments accept that)."""
     body_dict: dict[str, Any] = {"input": "verify.py probe"}
-    try:
-        with urllib.request.urlopen(
-            urllib.request.Request(f"http://127.0.0.1:{port}/v1/models"), timeout=2.0
-        ) as resp:
-            models = json.loads(resp.read(2048).decode("utf-8", errors="replace"))
-        first = (models.get("data") or [{}])[0].get("id")
-        if isinstance(first, str) and first:
-            body_dict["model"] = first
-    except Exception:
-        pass  # fall through with no .model field — many llama.cpp deploys accept that
+    if model is not None:
+        body_dict["model"] = model
     try:
         body = json.dumps(body_dict).encode()
         req = urllib.request.Request(
@@ -396,21 +383,64 @@ def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
             data=body, headers={"Content-Type": "application/json"}, method="POST",
         )
         with urllib.request.urlopen(req, timeout=3.0) as resp:
-            payload = json.loads(resp.read(8192).decode("utf-8", errors="replace"))
+            payload = json.loads(resp.read(65536).decode("utf-8", errors="replace"))
         emb = (payload.get("data") or [{}])[0].get("embedding")
         if not isinstance(emb, list) or not emb:
-            return False, "no .data[0].embedding in response"
-        model_used = body_dict.get("model", "<unspecified>")
-        return True, f"embedding dim={len(emb)} model={model_used}"
+            return False, f"no .data[0].embedding (model={model or '<unspecified>'})"
+        return True, f"embedding dim={len(emb)} model={model or '<unspecified>'}"
     except urllib.error.HTTPError as e:
-        # Gate-28 TT1 also: surface response body so misrouting/auth errors are diagnosable.
         try:
             err_body = e.read(512).decode("utf-8", errors="replace")[:120]
         except Exception:
             err_body = ""
-        return False, f"HTTP {e.code}{(': ' + err_body) if err_body else ''}"
+        return False, f"HTTP {e.code} (model={model or '<unspecified>'}){(': ' + err_body) if err_body else ''}"
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:60]}"
+
+
+def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
+    """Find a model that successfully responds to /v1/embeddings.
+    Gate-29 UU1 strategy:
+      1. Read the FULL /v1/models response (no byte truncation), enumerate
+         every model id.
+      2. Try each id in turn against /v1/embeddings; first success wins
+         (handles multi-model servers where data[0] isn't the embedding
+         model).
+      3. If discovery fails or no listed model works, fall back to a
+         model-less request — many single-model llama.cpp deployments
+         accept that.
+    Returns the FIRST success or, if none, the LAST informative failure
+    so operators can see what was tried.
+    """
+    discovered_models: list[str] = []
+    discovery_err: str | None = None
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(f"http://127.0.0.1:{port}/v1/models"), timeout=2.0
+        ) as resp:
+            models = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if isinstance(models, dict):
+            for entry in models.get("data") or []:
+                mid = entry.get("id") if isinstance(entry, dict) else None
+                if isinstance(mid, str) and mid:
+                    discovered_models.append(mid)
+    except Exception as e:
+        discovery_err = f"/v1/models discovery: {type(e).__name__}: {str(e)[:60]}"
+
+    last_failure = ""
+    for model_id in discovered_models:
+        ok, note = _try_embed_with_model(port, model_id)
+        if ok:
+            return True, note
+        last_failure = note
+    # Try omitting the model field (works on most single-model deploys).
+    ok, note = _try_embed_with_model(port, None)
+    if ok:
+        return True, note
+    last_failure = note if not last_failure else f"{last_failure}; {note}"
+    if discovery_err:
+        last_failure = f"{discovery_err}; {last_failure}"
+    return False, last_failure
 
 
 def _probe_rerank_endpoint(port: int) -> tuple[bool, str]:
