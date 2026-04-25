@@ -14,7 +14,7 @@
 #   proof             — aggregate .ready.json files into pkg/.proof/ALL.ready.json
 #   clean             — remove dist/ and .proof/
 
-.PHONY: all local mac-only macos linux linux-x86_64 linux-aarch64 docker cloud cloud-modal cloud-lambda cloud-ray models dashboards proof clean
+.PHONY: all local mac-only macos linux linux-x86_64 linux-aarch64 docker cloud cloud-modal cloud-lambda cloud-ray models dashboards proof proof-full clean
 
 VERSION ?= $(shell git describe --tags --always --dirty)
 ROOT := $(shell git rev-parse --show-toplevel)
@@ -82,13 +82,25 @@ dashboards:
 # `make proof` runs inside the package builder before any rag stack
 # is up; full-stack reachability is left to `proof-full` in the
 # parent Makefile.
-proof:
+proof: PROOF_OFFLINE := 1
+proof: PROOF_SKIP := qmd,multilspy,pyright,vaults
+# Gate-20 MM4: proof-full is the comprehensive ship gate that enforces
+# EVERY completeness check. Run after `make rag-up` + ingestion + the
+# dev-tool install (pipx install pyright multilspy qmd) has actually
+# provisioned qmd/multilspy/pyright/vaults. Without MM4 the pkg
+# Makefile advertised install-completeness gating but permanently
+# skipped four verifier checks, with no in-repo path to ever enforce
+# them.
+proof-full: PROOF_OFFLINE := 0
+proof-full: PROOF_SKIP :=
+
+proof proof-full:
 	@python3 pkg/scripts/aggregate_proof.py $(PROOF_DIR) > $(PROOF_DIR)/ALL.ready.json
 	@echo "ALL.ready.json written:"
 	@cat $(PROOF_DIR)/ALL.ready.json | python3 -m json.tool | head -40
 	@echo
-	@echo "Running install-completeness verifier:"
-	@NLR_VERIFY_OFFLINE=1 NLR_VERIFY_SKIP=qmd,multilspy,pyright,vaults \
+	@echo "Running install-completeness verifier (offline=$(PROOF_OFFLINE) skip=[$(PROOF_SKIP)]):"
+	@NLR_VERIFY_OFFLINE=$(PROOF_OFFLINE) NLR_VERIFY_SKIP=$(PROOF_SKIP) \
 	    python3 pkg/scripts/verify.py > $(PROOF_DIR)/INSTALL_COMPLETE.ready.json \
 	  && cat $(PROOF_DIR)/INSTALL_COMPLETE.ready.json | python3 -m json.tool | head -30 \
 	  || (echo "ERROR: verify.py reported install-completeness failure (see above)"; exit 1)

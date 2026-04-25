@@ -108,7 +108,18 @@ def main(proof_dir: str) -> int:
             # green_excluding_skipped. A cred'd re-run flips these to ready.
             all_green = False
         elif state == "ready":
-            if not data.get("sha256") or not data.get("artifact"):
+            # Gate-20 MM3: INSTALL_COMPLETE is a meta-proof written by
+            # verify.py (install-completeness gate), not a per-target
+            # builder proof. Builder proofs must carry an artifact + its
+            # sha256 so the ship bundle is integrity-checked. verify.py
+            # attests to POST-build completeness (MCP wired, hooks
+            # mirrored, arch correct) — there is no artifact. Accept
+            # state:"ready" from INSTALL_COMPLETE without the
+            # artifact/sha256 requirement; all other targets still
+            # require both to go green.
+            if tgt == "INSTALL_COMPLETE":
+                pass  # state=ready alone is sufficient for the meta-proof
+            elif not data.get("sha256") or not data.get("artifact"):
                 all_green = False
                 all_green_excl_skipped = False
         else:
