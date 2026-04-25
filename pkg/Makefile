@@ -69,10 +69,29 @@ models:
 dashboards:
 	@bash pkg/dashboards/bring-up.sh
 
+# Gate-20 MM1: wire verify.py into the package proof flow so the
+# install-completeness checks (MCP initialize probe, hooks roster,
+# arch detection, etc.) actually feed the shipping gate. Two artifacts
+# get written:
+#   - ALL.ready.json: aggregate of per-target builder proofs (existing).
+#   - INSTALL_COMPLETE.ready.json: verify.py output (new this gate).
+# `aggregate_proof.py` consumes ALL.ready as the green/skipped builder
+# state. INSTALL_COMPLETE.ready is the install-completeness gate the
+# parent Makefile (top-level orchestrator) requires for the full
+# `make all` ship contract. NLR_VERIFY_OFFLINE=1 is set here because
+# `make proof` runs inside the package builder before any rag stack
+# is up; full-stack reachability is left to `proof-full` in the
+# parent Makefile.
 proof:
 	@python3 pkg/scripts/aggregate_proof.py $(PROOF_DIR) > $(PROOF_DIR)/ALL.ready.json
 	@echo "ALL.ready.json written:"
 	@cat $(PROOF_DIR)/ALL.ready.json | python3 -m json.tool | head -40
+	@echo
+	@echo "Running install-completeness verifier:"
+	@NLR_VERIFY_OFFLINE=1 NLR_VERIFY_SKIP=qmd,multilspy,pyright,vaults \
+	    python3 pkg/scripts/verify.py > $(PROOF_DIR)/INSTALL_COMPLETE.ready.json \
+	  && cat $(PROOF_DIR)/INSTALL_COMPLETE.ready.json | python3 -m json.tool | head -30 \
+	  || (echo "ERROR: verify.py reported install-completeness failure (see above)"; exit 1)
 
 clean:
 	rm -rf $(DIST_DIR) $(PROOF_DIR)
