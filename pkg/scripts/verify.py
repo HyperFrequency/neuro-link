@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -372,7 +373,11 @@ OPTIONAL_LLAMA_PORTS = [8402]        # qexpand (informational)
 
 def _try_embed_with_model(port: int, model: str | None) -> tuple[bool, str]:
     """One /v1/embeddings POST attempt. model=None omits the field
-    entirely (many single-model llama.cpp deployments accept that)."""
+    entirely (many single-model llama.cpp deployments accept that).
+    Gate-30 VV1: read the FULL response body — a 4096-dim embedding
+    in JSON can exceed 64 KB, so the prior 65536-byte cap could
+    truncate valid responses and trigger a json.loads parse error
+    against a healthy server."""
     body_dict: dict[str, Any] = {"input": "verify.py probe"}
     if model is not None:
         body_dict["model"] = model
@@ -383,7 +388,7 @@ def _try_embed_with_model(port: int, model: str | None) -> tuple[bool, str]:
             data=body, headers={"Content-Type": "application/json"}, method="POST",
         )
         with urllib.request.urlopen(req, timeout=3.0) as resp:
-            payload = json.loads(resp.read(65536).decode("utf-8", errors="replace"))
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
         emb = (payload.get("data") or [{}])[0].get("embedding")
         if not isinstance(emb, list) or not emb:
             return False, f"no .data[0].embedding (model={model or '<unspecified>'})"
@@ -427,17 +432,43 @@ def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
     except Exception as e:
         discovery_err = f"/v1/models discovery: {type(e).__name__}: {str(e)[:60]}"
 
+    # Gate-30 VV2: bound the probe loop. Dedupe + cap at 8 candidates
+    # + total wall-clock budget of 12 seconds. Prioritize ids with
+    # "embed" in the name. Without this, a multi-model deploy with
+    # dozens of slow-rejecting ids could stall proof-full for minutes.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for mid in discovered_models:
+        if mid not in seen:
+            seen.add(mid)
+            deduped.append(mid)
+    deduped.sort(key=lambda m: 0 if "embed" in m.lower() else 1)
+    MAX_CANDIDATES = 8
+    BUDGET_SEC = 12.0
+    if len(deduped) > MAX_CANDIDATES:
+        truncated_count = len(deduped) - MAX_CANDIDATES
+        deduped = deduped[:MAX_CANDIDATES]
+    else:
+        truncated_count = 0
+
     last_failure = ""
-    for model_id in discovered_models:
+    deadline = time.monotonic() + BUDGET_SEC
+    for model_id in deduped:
+        if time.monotonic() >= deadline:
+            last_failure = (last_failure + "; " if last_failure else "") + f"probe budget {BUDGET_SEC}s exhausted"
+            break
         ok, note = _try_embed_with_model(port, model_id)
         if ok:
             return True, note
         last_failure = note
-    # Try omitting the model field (works on most single-model deploys).
-    ok, note = _try_embed_with_model(port, None)
-    if ok:
-        return True, note
-    last_failure = note if not last_failure else f"{last_failure}; {note}"
+    # Try omitting the model field if budget remains.
+    if time.monotonic() < deadline:
+        ok, note = _try_embed_with_model(port, None)
+        if ok:
+            return True, note
+        last_failure = note if not last_failure else f"{last_failure}; {note}"
+    if truncated_count:
+        last_failure = f"{last_failure} (skipped {truncated_count} extra ids past cap={MAX_CANDIDATES})"
     if discovery_err:
         last_failure = f"{discovery_err}; {last_failure}"
     return False, last_failure
