@@ -192,14 +192,21 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
     // breaking existing deployments that only have `02-KB-main/`. The
     // reverse is also true — a repo that has already moved everything to
     // `vaults/` doesn't need a placeholder `02-KB-main/`.
-    // Gate-31 WW2: dedupe by relative path across roots. The migration
-    // window allows both `vaults/` (canonical) and `02-KB-main/`
-    // (legacy) to coexist; without dedup, a file present in both
-    // (e.g. tool/x.md) gets indexed twice as distinct Qdrant points
-    // (Uuid::new_v4() per upsert), producing noisy retrieval. Walk
-    // DEFAULT_VAULT_DIRS in declared order — vaults/ first per
-    // module docs — and skip a relative path the second time.
+    // Gate-31 WW2 + Gate-32 XX1: dedupe by relative path across roots,
+    // but only AFTER a successful upsert. If vaults/x.md fails to
+    // read/embed/upsert, 02-KB-main/x.md must still be tried — prior
+    // logic marked the path as seen pre-upsert and could drop a
+    // single-file failure in the preferred root.
+    // Gate-32 XX2: workspace-scoped UUID namespace. Different repos
+    // pointed at the same Qdrant collection (e.g. shared dev cluster)
+    // would otherwise generate the same v5 UUID for "docs/index.md"
+    // and silently overwrite each other. Mix the canonicalized root
+    // path into the namespace so each workspace gets its own ID space.
     let mut seen_rels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let workspace_ns = {
+        let root_path = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, root_path.to_string_lossy().as_bytes())
+    };
     for vault_name in DEFAULT_VAULT_DIRS {
         let vault_root = root.join(vault_name);
         if !vault_root.is_dir() {
@@ -218,8 +225,8 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
                 .unwrap_or(path)
                 .display()
                 .to_string();
-            if !seen_rels.insert(rel.clone()) {
-                continue;  // already indexed from an earlier root (vaults/ wins)
+            if seen_rels.contains(&rel) {
+                continue;  // already SUCCESSFULLY upserted from an earlier root
             }
             let content = fs::read_to_string(path).unwrap_or_default();
 
@@ -250,11 +257,13 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
             // Only count upserts that Qdrant actually accepted; previously
             // the counter was bumped on any send() resolution, making
             // silent rejects invisible in the success log.
-            // Gate-31 WW2: deterministic UUID v5 keyed off relative path
-            // means re-embeds OVERWRITE the same Qdrant point instead of
-            // creating a new one each run (which previously left stale
-            // copies after content changes).
-            let point_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, rel.as_bytes()).to_string();
+            // Gate-31 WW2 + Gate-32 XX2: deterministic UUID v5 keyed
+            // off rel path WITHIN a workspace-scoped namespace. Same
+            // workspace + same rel path → same point ID (re-embeds
+            // overwrite). Different workspace + same rel path →
+            // different point ID (no cross-workspace clobber on a
+            // shared Qdrant deployment).
+            let point_id = uuid::Uuid::new_v5(&workspace_ns, rel.as_bytes()).to_string();
             let upsert_url = format!("{qdrant_url}/collections/{collection}/points");
             match client
                 .put(&upsert_url)
@@ -272,6 +281,12 @@ pub async fn embed_wiki(root: &Path, qdrant_url: &str, recreate: bool) -> Result
                     let status = resp.status();
                     if status.is_success() {
                         count += 1;
+                        // Gate-32 XX1: mark rel as seen ONLY after
+                        // successful upsert. A failed vaults/x.md
+                        // earlier in the loop (or upstream) leaves
+                        // 02-KB-main/x.md eligible for retry from
+                        // the legacy root.
+                        seen_rels.insert(rel.clone());
                     } else {
                         let body = resp.text().await.unwrap_or_default();
                         tracing::warn!(
