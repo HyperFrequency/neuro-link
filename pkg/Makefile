@@ -118,9 +118,13 @@ proof-full:
 	# downstream consumers. verify.py's main() also clears stale state
 	# files but only after it reaches that code path; this rm runs
 	# before the interpreter is even invoked.
+	# Gate-27 SS1: also delete the aggregate file so a failed retry
+	# can't leave a stale green ALL.ready.json on disk if verify.py
+	# fails before the re-aggregation step runs.
 	@rm -f $(PROOF_DIR)/INSTALL_COMPLETE.ready.json \
 	       $(PROOF_DIR)/INSTALL_COMPLETE.incomplete.json \
-	       $(PROOF_DIR)/INSTALL_COMPLETE.fail.json
+	       $(PROOF_DIR)/INSTALL_COMPLETE.fail.json \
+	       $(PROOF_DIR)/ALL.ready.json
 	@echo "Running full install-completeness verifier (no skips, live probes):"
 	@NLR_VERIFY_OFFLINE=0 NLR_VERIFY_SKIP= python3 pkg/scripts/verify.py \
 	  || (echo "ERROR: verify.py reported install-completeness failure (see above)"; exit 1)

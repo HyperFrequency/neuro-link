@@ -370,37 +370,89 @@ REQUIRED_LLAMA_PORTS = [8400, 8401]  # embed + rerank
 OPTIONAL_LLAMA_PORTS = [8402]        # qexpand (informational)
 
 
+def _probe_embed_endpoint(port: int) -> tuple[bool, str]:
+    """POST a minimal request to /v1/embeddings — must return a JSON
+    object with .data[0].embedding present. Proves the listener is
+    actually configured for embeddings, not e.g. completion mode."""
+    try:
+        body = json.dumps({"input": "verify.py probe", "model": "octen"}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/embeddings",
+            data=body, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            payload = json.loads(resp.read(8192).decode("utf-8", errors="replace"))
+        emb = (payload.get("data") or [{}])[0].get("embedding")
+        if not isinstance(emb, list) or not emb:
+            return False, "no .data[0].embedding in response"
+        return True, f"embedding dim={len(emb)}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:60]}"
+
+
+def _probe_rerank_endpoint(port: int) -> tuple[bool, str]:
+    """POST a minimal request to /reranking — must return a JSON
+    object with .results array. Proves the listener is actually a
+    reranker, not e.g. an embedding-mode server on the same port."""
+    try:
+        body = json.dumps({
+            "query": "verify.py probe",
+            "documents": ["doc one", "doc two"],
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/reranking",
+            data=body, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            payload = json.loads(resp.read(8192).decode("utf-8", errors="replace"))
+        results = payload.get("results")
+        if not isinstance(results, list) or not results:
+            return False, "no .results array in response"
+        return True, f"results count={len(results)}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:60]}"
+
+
 def check_llama_servers() -> dict[str, Any]:
     if "llama-servers" in SKIP or OFFLINE:
         return _skipped("llama-servers", "NLR_VERIFY_OFFLINE or SKIP")
-    # Gate-26 RR1: per-port REQUIRED check, not "at least 1". The live
-    # RAG path is octen_search → :8400 (embed) → qdrant → :8401 (rerank).
-    # Both endpoints are non-substitutable — :8402 (qexpand) is
-    # informational only and doesn't gate ready. Earlier "any 1
-    # reachable" let proof-full pass with embed down + qexpand up,
-    # which would still break user-visible retrieval at runtime.
-    req_down: list[int] = []
-    req_up: list[int] = []
-    for port in REQUIRED_LLAMA_PORTS:
-        ok, _ = _http_ok(f"http://127.0.0.1:{port}/v1/models", timeout=2.0)
-        (req_up if ok else req_down).append(port)
+    # Gate-26 RR1 + Gate-27 SS2: per-port REQUIRED check with role-
+    # specific probes. /v1/models alone proved the listener exists but
+    # not that it's serving the right role; an embed-mode server on
+    # :8401 would have passed RR1 but broken rerank at query time.
+    # Now: :8400 must succeed at /v1/embeddings (returns .data[0].
+    # embedding), :8401 must succeed at /reranking (returns .results).
+    # :8402 (qexpand) is informational — checked at /v1/models only.
+    req_results: dict[int, tuple[bool, str]] = {}
+    req_results[8400] = _probe_embed_endpoint(8400)
+    req_results[8401] = _probe_rerank_endpoint(8401)
+    failed_ports = [p for p, (ok, _) in req_results.items() if not ok]
+    if failed_ports:
+        details = "; ".join(f":{p}({reason})" for p, (_, reason) in req_results.items())
+        return _fail(
+            "llama-servers",
+            f"required llama role probes failed for ports {failed_ports}: {details}",
+        )
     opt_up: list[int] = []
     opt_down: list[int] = []
     for port in OPTIONAL_LLAMA_PORTS:
         ok, _ = _http_ok(f"http://127.0.0.1:{port}/v1/models", timeout=2.0)
         (opt_up if ok else opt_down).append(port)
-    if req_down:
-        return _fail(
-            "llama-servers",
-            f"required llama ports down: {req_down} (need ALL of {REQUIRED_LLAMA_PORTS}); reachable: {req_up + opt_up}",
-        )
-    note = f"required {req_up} OK; optional {opt_up} OK, {opt_down} down"
+    note = (
+        f"required: :8400 embed {req_results[8400][1]}, "
+        f":8401 rerank {req_results[8401][1]}; "
+        f"optional :8402 qexpand " + ("up" if opt_up else "down")
+    )
     return {
         "name": "llama-servers",
         "status": "pass",
         "note": note,
-        "reachable": req_up + opt_up,
-        "down": req_down + opt_down,
+        "reachable": list(REQUIRED_LLAMA_PORTS) + opt_up,
+        "down": opt_down,
     }
 
 
