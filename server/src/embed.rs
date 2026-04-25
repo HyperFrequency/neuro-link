@@ -87,36 +87,54 @@ pub fn resolve_workspace_id(root: &Path) -> Result<String> {
             )));
         }
     }
-    fs::rename(&temp, &cache).with_context(|| {
-        format!(
-            "failed to publish workspace id from {} to {}",
-            temp.display(),
-            cache.display()
-        )
-    })?;
-    // Gate-38 DDD3: durably persist the directory entry. Best-effort
-    // on platforms where opening a directory for write isn't allowed
-    // (e.g. Windows) — file contents are already synced, so the
-    // window for losing the entry is small.
+    // Gate-39 EEE1: restore no-replace publication via hard_link.
+    // rename overwrites silently and let two racing first-run callers
+    // each return a different UUID even though the final cache held
+    // only one — splitting one workspace across two namespaces. Hard
+    // link is unsupported on a few oddball filesystems (FAT/exFAT,
+    // some SMB/FUSE) but on those NLR_WORKSPACE_ID is the documented
+    // explicit-set escape hatch.
+    match std::fs::hard_link(&temp, &cache) {
+        Ok(()) => {
+            temp_cleanup();
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another caller landed first. Their content was synced
+            // before they linked, so the file is non-empty.
+            temp_cleanup();
+            let persisted = fs::read_to_string(&cache).with_context(|| {
+                format!("workspace id file {} exists but unreadable", cache.display())
+            })?;
+            let trimmed = persisted.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "workspace id file {} exists but is empty (concurrent create may have stalled or interrupted; \
+                     delete the empty file and re-run, or set NLR_WORKSPACE_ID explicitly)",
+                    cache.display()
+                );
+            }
+            return Ok(trimmed.to_string());
+        }
+        Err(e) => {
+            temp_cleanup();
+            return Err(anyhow::Error::from(e).context(format!(
+                "failed to link workspace id into {} (filesystems without hard_link support \
+                 such as FAT/exFAT or some SMB/FUSE mounts must set NLR_WORKSPACE_ID explicitly)",
+                cache.display()
+            )));
+        }
+    }
+    // Gate-38 DDD3 (best-effort): durably persist the directory entry.
+    // Documented as best-effort: on platforms where directory open-
+    // for-write is denied (Windows, some sandboxes), this is a no-op.
+    // File contents were sync_all'd above, so the window for losing
+    // the new directory entry across crashes is narrow but non-zero.
     if let Some(parent) = cache.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
         }
     }
-    // Read back to discover whose UUID won the rename race (rename
-    // overwrites silently; if two processes race, the second
-    // overwrites the first — both must converge on the surviving id).
-    let actual = fs::read_to_string(&cache).with_context(|| {
-        format!("workspace id file {} appeared but unreadable", cache.display())
-    })?;
-    let trimmed = actual.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!(
-            "workspace id file {} is empty after publish — concurrent writer interrupted",
-            cache.display()
-        );
-    }
-    Ok(trimmed.to_string())
+    Ok(new_id)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
