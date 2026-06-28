@@ -1,0 +1,27 @@
+{
+  "name": "@neuro-link/openclaw",
+  "version": "0.2.0",
+  "description": "neuro-link helper for OpenClaw — installs hooks into ~/.openclaw/ and prints proxy env vars.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HyperFrequency/neuro-link-recursive",
+    "directory": "npm/packages/openclaw"
+  },
+  "bin": {
+    "neuro-link-openclaw": "bin/neuro-link-openclaw.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "_shared/",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js install"
+  },
+  "keywords": ["neuro-link", "openclaw", "hooks", "mcp"],
+  "engines": {
+    "node": ">=18"
+  }
+}

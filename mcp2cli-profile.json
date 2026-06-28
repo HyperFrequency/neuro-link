@@ -1,0 +1,33 @@
+{
+  "profile": "neuro-link-recursive",
+  "version": 1,
+  "transport": {
+    "type": "stdio",
+    "command": "server/target/release/neuro-link-mcp"
+  },
+  "tools": [
+    { "mcp_name": "nlr_wiki_create",       "cli_name": "wiki-create" },
+    { "mcp_name": "nlr_wiki_read",         "cli_name": "wiki-read" },
+    { "mcp_name": "nlr_wiki_update",       "cli_name": "wiki-update" },
+    { "mcp_name": "nlr_wiki_list",         "cli_name": "wiki-list" },
+    { "mcp_name": "nlr_wiki_search",       "cli_name": "wiki-search" },
+    { "mcp_name": "nlr_rag_query",         "cli_name": "rag-query" },
+    { "mcp_name": "nlr_rag_rebuild_index", "cli_name": "rag-rebuild" },
+    { "mcp_name": "nlr_ontology_generate", "cli_name": "ontology-generate" },
+    { "mcp_name": "nlr_ontology_query",    "cli_name": "ontology-query" },
+    { "mcp_name": "nlr_ontology_gaps",     "cli_name": "ontology-gaps" },
+    { "mcp_name": "nlr_ingest",            "cli_name": "ingest" },
+    { "mcp_name": "nlr_ingest_classify",   "cli_name": "ingest-classify" },
+    { "mcp_name": "nlr_ingest_dedup",      "cli_name": "ingest-dedup" },
+    { "mcp_name": "nlr_task_list",         "cli_name": "task-list" },
+    { "mcp_name": "nlr_task_create",       "cli_name": "task-create" },
+    { "mcp_name": "nlr_task_update",       "cli_name": "task-update" },
+    { "mcp_name": "nlr_harness_dispatch",  "cli_name": "harness-dispatch" },
+    { "mcp_name": "nlr_harness_list",      "cli_name": "harness-list" },
+    { "mcp_name": "nlr_scan_health",       "cli_name": "scan-health" },
+    { "mcp_name": "nlr_scan_staleness",    "cli_name": "scan-staleness" },
+    { "mcp_name": "nlr_state_heartbeat",   "cli_name": "state-heartbeat" },
+    { "mcp_name": "nlr_state_log",         "cli_name": "state-log" },
+    { "mcp_name": "nlr_config_read",       "cli_name": "config-read" }
+  ]
+}

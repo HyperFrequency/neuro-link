@@ -1,0 +1,10 @@
+{
+  "id": "neuro-link-recursive",
+  "name": "Neuro-Link Recursive",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Unified API harness communication, hybrid RAG & LLM-Wiki control plane. Manage API keys, execute nlr commands, configure harness bridges, BYOK chatbot, and view neuro-stats.",
+  "author": "HyperFrequency",
+  "authorUrl": "https://github.com/HyperFrequency",
+  "isDesktopOnly": true
+}

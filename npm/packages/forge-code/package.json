@@ -1,0 +1,27 @@
+{
+  "name": "@neuro-link/forge-code",
+  "version": "0.2.0",
+  "description": "neuro-link helper for ForgeCode — installs hooks into ~/.forge/ and prints proxy env vars.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HyperFrequency/neuro-link-recursive",
+    "directory": "npm/packages/forge-code"
+  },
+  "bin": {
+    "neuro-link-forge-code": "bin/neuro-link-forge-code.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "_shared/",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js install"
+  },
+  "keywords": ["neuro-link", "forge-code", "forgecode", "hooks", "mcp"],
+  "engines": {
+    "node": ">=18"
+  }
+}

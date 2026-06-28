@@ -1,0 +1,85 @@
+services:
+  neuro-link:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    # Bearer-auth is in front of this, but default to loopback binding for
+    # consistency with the other runtime services. Expose publicly through
+    # the ngrok tunnel, not by flipping the bind.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./00-raw:/data/00-raw
+      - ./01-sorted:/data/01-sorted
+      - ./02-KB-main:/data/02-KB-main
+      - ./03-ontology-main:/data/03-ontology-main
+      - ./04-KB-agents-workflows:/data/04-KB-agents-workflows
+      - ./07-neuro-link-task:/data/07-neuro-link-task
+      - ./08-code-docs:/data/08-code-docs
+      - ./config:/data/config
+      - ./state:/data/state
+    env_file:
+      - secrets/.env
+    environment:
+      NLR_ROOT: /data
+      QDRANT_URL: http://qdrant:6333
+      NEO4J_HTTP_URL: http://neo4j:7474
+    command: ["neuro-link", "serve", "--port", "8080", "--token", "auto"]
+    depends_on:
+      - qdrant
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-nlr
+    # Default: bind to localhost only. Flip to 0.0.0.0 via
+    # `setup-deps.sh --expose-all` after explicit consent (see INSTALL.md).
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5
+    container_name: neo4j-nlr
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      # Neo4j credentials are sourced from secrets/.env. Fail-closed if unset:
+      # compose aborts with a clear message. Generate with:
+      #   openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 32
+      # ...or let setup-deps.sh do it on first run.
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in secrets/.env}"
+    volumes:
+      - neo4j-data:/data
+    restart: unless-stopped
+
+  # Obsidian headless — runs Obsidian over a web VNC so the runtime
+  # vault at ${OBSIDIAN_VAULT_PATH:-~/Vaults/neuro-link} can be opened
+  # remotely (browser → http://localhost:8501) and the
+  # neuro-link-recursive Obsidian plugin can be enabled without a desktop.
+  # See: https://docs.linuxserver.io/images/docker-obsidian/
+  obsidian-headless:
+    image: lscr.io/linuxserver/obsidian:latest
+    container_name: obsidian-nlr
+    # NoVNC has NO authentication by default (CVSS 9.6 — see security-threats.md T1).
+    # Bind to 127.0.0.1 only; expose via the bearer-auth reverse proxy later.
+    ports:
+      - "127.0.0.1:8501:3000"   # web UI (HTTP)
+      - "127.0.0.1:8502:3001"   # web UI (HTTPS)
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "${TZ:-America/Los_Angeles}"
+      TITLE: "Neuro-Link Obsidian"
+    volumes:
+      - obsidian-config:/config
+      - ${OBSIDIAN_VAULT_PATH:-./02-KB-main}:/vaults/neuro-link
+    shm_size: "1gb"
+    restart: unless-stopped
+
+volumes:
+  qdrant-data:
+  neo4j-data:
+  obsidian-config:

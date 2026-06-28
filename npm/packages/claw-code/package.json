@@ -1,0 +1,27 @@
+{
+  "name": "@neuro-link/claw-code",
+  "version": "0.2.0",
+  "description": "neuro-link helper for Claw-Code — installs hooks into ~/.claw/ and prints proxy env vars.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HyperFrequency/neuro-link-recursive",
+    "directory": "npm/packages/claw-code"
+  },
+  "bin": {
+    "neuro-link-claw-code": "bin/neuro-link-claw-code.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "_shared/",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js install"
+  },
+  "keywords": ["neuro-link", "claw-code", "clawcode", "hooks", "mcp"],
+  "engines": {
+    "node": ">=18"
+  }
+}

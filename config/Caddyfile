@@ -1,0 +1,144 @@
+# Caddyfile — TurboVault public exposure gate
+#
+# Architecture:
+#   ngrok edge (TLS) -> Caddy :8080 -> TurboVault (127.0.0.1:3001 HTTP, :3002 WS)
+#
+# Caddy's job: bearer-token auth. Terminate nothing, just verify Authorization
+# header matches ${NLR_API_TOKEN} from the environment, then reverse-proxy.
+#
+# Required env:
+#   NLR_API_TOKEN  - shared secret; issued by Obsidian plugin, stored in secrets/.env
+#
+# Optional env:
+#   CADDY_LOG_LEVEL   - DEBUG|INFO|WARN|ERROR (default INFO)
+
+{
+	# Global options — no admin API exposed, structured logs, no auto-HTTPS
+	# (ngrok terminates TLS at the edge, Caddy speaks plain HTTP on loopback).
+	admin off
+	auto_https off
+	log {
+		output stdout
+		format json
+		level {$CADDY_LOG_LEVEL:INFO}
+	}
+}
+
+# Bind to loopback only — ngrok is the sole ingress path.
+http://127.0.0.1:8080 {
+
+	# -----------------------------------------------------------------
+	# Access log — successes at DEBUG, everything else at INFO.
+	# The request-header filter strips the bearer token before it ever
+	# touches disk.
+	# -----------------------------------------------------------------
+	log {
+		output stdout
+		format json {
+			time_format iso8601
+		}
+		level {$CADDY_LOG_LEVEL:INFO}
+	}
+	log_format filter {
+		# Redact the bearer token in any logged request header.
+		request>headers>Authorization delete
+		request>headers>Cookie delete
+	}
+
+	# -----------------------------------------------------------------
+	# Health check — unauthenticated, for ngrok edge probes.
+	# Must come before the auth matcher or it will 401.
+	# -----------------------------------------------------------------
+	handle /healthz {
+		respond "ok" 200 {
+			close
+		}
+	}
+
+	# -----------------------------------------------------------------
+	# Rate limit — 60 req/min per client IP across everything else.
+	# Uses the caddy-ratelimit plugin (github.com/mholt/caddy-ratelimit).
+	# If that plugin isn't compiled in, remove this block; ngrok has
+	# its own edge rate limit as a fallback.
+	# -----------------------------------------------------------------
+	rate_limit {
+		zone per_ip {
+			key    {remote_host}
+			events 60
+			window 1m
+		}
+	}
+
+	# -----------------------------------------------------------------
+	# Connection caps — bound concurrent WS subscribers so that a single
+	# misbehaving client can't DoS subscribe_vault_events.
+	# -----------------------------------------------------------------
+	servers {
+		max_header_size 16KB
+	}
+
+	# -----------------------------------------------------------------
+	# Bearer-token gate.
+	# Any request missing or mismatching Authorization: Bearer <token>
+	# gets a 401 with a WARN-level log line (IP + timestamp, no body).
+	# -----------------------------------------------------------------
+	@unauthenticated not header Authorization "Bearer {$NLR_API_TOKEN}"
+
+	handle @unauthenticated {
+		log_name auth_failure
+		respond "unauthorized" 401 {
+			close
+		}
+	}
+
+	# -----------------------------------------------------------------
+	# WebSocket upgrades -> TurboVault :3002
+	# Match on Upgrade: websocket header (case-insensitive per RFC 6455).
+	# reverse_proxy handles Connection/Upgrade passthrough natively when
+	# the upstream speaks WS on a plain HTTP listener.
+	# -----------------------------------------------------------------
+	@websocket {
+		header Connection *Upgrade*
+		header Upgrade    websocket
+	}
+
+	handle @websocket {
+		reverse_proxy 127.0.0.1:3002 {
+			# Preserve client identity end-to-end.
+			header_up Host              {upstream_hostport}
+			header_up X-Real-IP         {remote_host}
+			header_up X-Forwarded-For   {remote_host}
+			header_up X-Forwarded-Proto https
+
+			# Long-lived streams — don't let Caddy time them out.
+			flush_interval -1
+			transport http {
+				read_timeout    24h
+				write_timeout   24h
+				dial_timeout    5s
+			}
+		}
+	}
+
+	# -----------------------------------------------------------------
+	# Everything else -> TurboVault HTTP :3001
+	# -----------------------------------------------------------------
+	handle {
+		reverse_proxy 127.0.0.1:3001 {
+			header_up Host              {upstream_hostport}
+			header_up X-Real-IP         {remote_host}
+			header_up X-Forwarded-For   {remote_host}
+			header_up X-Forwarded-Proto https
+
+			# Strip the bearer before it reaches the upstream — TurboVault
+			# is loopback-only and doesn't need it. Prevents accidental
+			# token leaks in upstream logs.
+			header_up -Authorization
+
+			transport http {
+				dial_timeout    5s
+				response_header_timeout 30s
+			}
+		}
+	}
+}

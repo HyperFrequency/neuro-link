@@ -1,0 +1,21 @@
+name: build
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+jobs:
+  rust-build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Install poppler for PDF tests
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Build
+        run: cd server && cargo build --release --bin neuro-link
+      - name: Test
+        run: cd server && cargo test --release --bin neuro-link

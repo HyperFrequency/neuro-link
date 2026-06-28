@@ -1,0 +1,20 @@
+rust ownership borrowing
+sharpe ratio calculation
+transformer attention mechanism
+bayesian prior posterior
+kelly criterion position sizing
+backpropagation gradient descent
+eigenvalue decomposition
+monte carlo tree search
+options black scholes formula
+volatility surface skew
+adam optimizer learning rate
+neo4j cypher pattern match
+vector database cosine similarity
+reinforcement learning policy gradient
+async rust tokio executor
+pytorch lightning trainer callback
+dropout regularization overfitting
+convex optimization lagrangian
+stochastic differential equation
+information geometry fisher

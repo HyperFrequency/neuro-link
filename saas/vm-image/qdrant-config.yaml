@@ -1,0 +1,12 @@
+storage:
+  storage_path: /state/qdrant/storage
+  snapshots_path: /state/qdrant/snapshots
+
+service:
+  host: 127.0.0.1
+  http_port: 6333
+  grpc_port: 6334
+  # Neuro-link authenticates via its own token; Qdrant is not public-facing
+  # (Caddy mounts it behind Cloudflare Access). No API key required internally.
+
+telemetry_disabled: true

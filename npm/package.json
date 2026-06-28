@@ -1,0 +1,58 @@
+{
+  "name": "neuro-link",
+  "version": "0.2.0",
+  "description": "Unified context, memory & behavior control plane for AI agent harnesses — hybrid RAG + LLM-Wiki system with auto-curation, reasoning ontologies, and recursive self-improvement.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HyperFrequency/neuro-link-recursive"
+  },
+  "homepage": "https://github.com/HyperFrequency/neuro-link-recursive#readme",
+  "bugs": {
+    "url": "https://github.com/HyperFrequency/neuro-link-recursive/issues"
+  },
+  "bin": {
+    "neuro-link": "bin/neuro-link.js",
+    "nlr": "bin/neuro-link.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "native/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "optionalDependencies": {
+    "@neuro-link/darwin-arm64": "0.2.0",
+    "@neuro-link/darwin-x64": "0.2.0",
+    "@neuro-link/linux-x64": "0.2.0",
+    "@neuro-link/win32-x64": "0.2.0"
+  },
+  "keywords": [
+    "mcp",
+    "llm-wiki",
+    "rag",
+    "knowledge-graph",
+    "ai-agents",
+    "obsidian",
+    "rust",
+    "claude-code",
+    "cline",
+    "harness"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ]
+}

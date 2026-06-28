@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>neuro-link</title>
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js" defer></script>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --panel: #121219;
+    --border: #1f1f2e;
+    --text: #e5e5e7;
+    --muted: #8888a0;
+    --accent: #7b68ee;
+    --ok: #10b981;
+    --warn: #f59e0b;
+    --err: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, system-ui, sans-serif; font-size: 14px; }
+  header { padding: 1rem 2rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 1rem; }
+  h1 { margin: 0; font-size: 1.2rem; font-weight: 600; }
+  .accent { color: var(--accent); }
+  main { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+  .card h3 { margin: 0 0 0.5rem 0; font-size: 0.8rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; }
+  .stat { font-size: 1.8rem; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 0.85rem; margin-top: 0.25rem; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .dot-ok { background: var(--ok); }
+  .dot-warn { background: var(--warn); }
+  .dot-err { background: var(--err); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 0.75rem; text-transform: uppercase; }
+  .services td { padding: 0.6rem 0.75rem; }
+  .services .name { font-weight: 500; }
+  .services .url { color: var(--muted); font-family: monospace; font-size: 0.8rem; }
+  button { background: var(--accent); color: white; border: none; padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+  button:hover { opacity: 0.9; }
+  .endpoint { background: #1a1a2e; padding: 0.5rem 0.75rem; border-radius: 4px; font-family: monospace; font-size: 0.8rem; word-break: break-all; }
+  .log-row { display: grid; grid-template-columns: 1fr 1fr 2fr 1fr 1fr; gap: 0.5rem; padding: 0.4rem 0.75rem; border-bottom: 1px solid var(--border); font-size: 0.8rem; align-items: center; }
+  .log-row:hover { background: var(--panel); }
+  .mono { font-family: monospace; }
+  .err-text { color: var(--err); }
+  .ok-text { color: var(--ok); }
+  h2 { font-size: 1rem; margin: 2rem 0 1rem 0; }
+</style>
+</head>
+<body x-data="dashboard()" x-init="init()">
+<header>
+  <h1>neuro<span class="accent">-link</span></h1>
+  <span class="sub" x-text="'v' + version"></span>
+  <div style="margin-left: auto; display: flex; align-items: center; gap: 1rem;">
+    <span x-show="lastRefresh" class="sub">Updated <span x-text="lastRefresh"></span></span>
+    <button @click="refresh()">Refresh</button>
+  </div>
+</header>
+
+<main>
+  <!-- Quick stats -->
+  <div class="grid">
+    <div class="card">
+      <h3>LLM Calls (7d)</h3>
+      <div class="stat" x-text="summary.total_calls || 0"></div>
+      <div class="sub" x-text="`error rate: ${((summary.error_rate || 0) * 100).toFixed(1)}%`"></div>
+    </div>
+    <div class="card">
+      <h3>Cost (7d)</h3>
+      <div class="stat">$<span x-text="(summary.total_cost_usd || 0).toFixed(2)"></span></div>
+      <div class="sub" x-text="`${summary.total_input_tokens || 0} in / ${summary.total_output_tokens || 0} out tokens`"></div>
+    </div>
+    <div class="card">
+      <h3>Wiki Pages</h3>
+      <div class="stat" x-text="wikiCount"></div>
+      <div class="sub" x-text="pendingTasks + ' pending tasks'"></div>
+    </div>
+    <div class="card">
+      <h3>RAG Hit Rate</h3>
+      <div class="stat" x-text="((grade.rag_injection_rate || 0) * 100).toFixed(0) + '%'"></div>
+      <div class="sub" x-text="`avg latency: ${grade.avg_latency_ms || 0}ms`"></div>
+    </div>
+    <div class="card">
+      <h3>Claude Code Sessions (7d)</h3>
+      <div class="stat" x-text="sessionsScan.sessions_analyzed || 0"></div>
+      <div class="sub" x-text="`${sessionsScan.total_flags || 0} quality flags detected`"></div>
+    </div>
+    <div class="card">
+      <h3>Top Flag</h3>
+      <div class="stat" style="font-size: 1.1rem;" x-text="topFlagType"></div>
+      <div class="sub" x-text="`${topFlagCount} occurrences`"></div>
+    </div>
+  </div>
+
+  <!-- Session quality details -->
+  <h2>Session Quality</h2>
+  <div class="card" style="padding: 0;">
+    <div class="log-row" style="background: var(--panel); font-weight: 500; text-transform: uppercase; font-size: 0.7rem; grid-template-columns: 1fr 1fr 1fr;">
+      <div>Flag Type</div><div>Count</div><div>Severity</div>
+    </div>
+    <template x-for="(count, flag) in (sessionsScan.flags_by_type || {})" :key="flag">
+      <div class="log-row" style="grid-template-columns: 1fr 1fr 1fr;">
+        <div class="mono" x-text="flag"></div>
+        <div x-text="count"></div>
+        <div>
+          <span class="dot" :class="count > 10 ? 'dot-err' : count > 3 ? 'dot-warn' : 'dot-ok'"></span>
+          <span x-text="count > 10 ? 'critical' : count > 3 ? 'warning' : 'info'"></span>
+        </div>
+      </div>
+    </template>
+    <div x-show="!sessionsScan.flags_by_type || Object.keys(sessionsScan.flags_by_type || {}).length === 0" class="sub" style="padding: 1rem; text-align: center;">
+      No quality flags. Run <code class="mono">neuro-link sessions scan</code> first.
+    </div>
+  </div>
+
+  <!-- Skill usage -->
+  <h2>Skill Usage (30d)</h2>
+  <div class="card" style="padding: 0;">
+    <div class="log-row" style="background: var(--panel); font-weight: 500; text-transform: uppercase; font-size: 0.7rem; grid-template-columns: 2fr 1fr 1fr;">
+      <div>Skill</div><div>Invocations</div><div>Sessions</div>
+    </div>
+    <template x-for="s in skillUsage" :key="s.skill">
+      <div class="log-row" style="grid-template-columns: 2fr 1fr 1fr;">
+        <div class="mono" x-text="s.skill"></div>
+        <div x-text="s.invocations"></div>
+        <div x-text="s.unique_sessions"></div>
+      </div>
+    </template>
+    <div x-show="skillUsage.length === 0" class="sub" style="padding: 1rem; text-align: center;">No skill data</div>
+  </div>
+
+  <!-- Services -->
+  <h2>Services</h2>
+  <div class="card" style="padding: 0;">
+    <table class="services">
+      <thead><tr><th>Service</th><th>URL</th><th>Status</th><th>Last Check</th></tr></thead>
+      <tbody>
+        <template x-for="svc in services" :key="svc.name">
+          <tr>
+            <td class="name" x-text="svc.name"></td>
+            <td class="url" x-text="svc.url"></td>
+            <td>
+              <span class="dot" :class="svc.healthy ? 'dot-ok' : 'dot-err'"></span>
+              <span x-text="svc.healthy ? 'healthy' : 'down'"></span>
+            </td>
+            <td class="sub" x-text="svc.last_check ? new Date(svc.last_check).toLocaleTimeString() : '—'"></td>
+          </tr>
+        </template>
+        <tr x-show="services.length === 0">
+          <td colspan="4" class="sub" style="text-align: center; padding: 1rem;">
+            No supervisor data. Run <code class="mono">neuro-link supervise</code> in another terminal.
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Connection info -->
+  <h2>Connect External Tools</h2>
+  <div class="grid" style="grid-template-columns: 1fr 1fr 1fr 1fr;">
+    <div class="card">
+      <h3>MCP Endpoint</h3>
+      <div class="endpoint" x-text="'http://localhost:8080/mcp'"></div>
+      <div class="sub" style="margin-top: 0.5rem;">stdio mode: <span class="mono">neuro-link mcp</span></div>
+    </div>
+    <div class="card">
+      <h3>LLM Passthrough Proxy</h3>
+      <div class="endpoint">http://localhost:8080/llm/v1</div>
+      <div class="sub" style="margin-top: 0.5rem;">Set <span class="mono">ANTHROPIC_BASE_URL</span> or <span class="mono">OPENAI_API_BASE</span></div>
+    </div>
+    <div class="card">
+      <h3>REST API</h3>
+      <div class="endpoint">http://localhost:8080/api/v1/&lt;resource&gt;</div>
+      <div class="sub" style="margin-top: 0.5rem;">wiki, rag, ingest, ontology, tasks, scan, harness, state, config, hooks, services</div>
+    </div>
+    <div class="card" x-data="{ copied: false, sample: `curl -s -X POST http://localhost:8080/api/v1/rag/query \\\n  -H \"Authorization: Bearer $NLR_API_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"query\":\"rust ownership\",\"limit\":3}'` }">
+      <h3 style="display: flex; justify-content: space-between; align-items: center;">
+        <span>Example Call</span>
+        <button style="font-size: 0.7rem; padding: 0.2rem 0.5rem;"
+                @click="navigator.clipboard.writeText(sample); copied = true; setTimeout(() => copied = false, 1500)"
+                x-text="copied ? 'Copied' : 'Copy'"></button>
+      </h3>
+      <pre class="endpoint" style="white-space: pre-wrap; line-height: 1.4;">curl -s -X POST http://localhost:8080/api/v1/rag/query \
+  -H "Authorization: Bearer $NLR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"rust ownership","limit":3}'</pre>
+    </div>
+  </div>
+
+  <!-- Recent LLM calls -->
+  <h2>Recent LLM Calls</h2>
+  <div class="card" style="padding: 0;">
+    <div class="log-row" style="background: var(--panel); font-weight: 500; text-transform: uppercase; font-size: 0.7rem;">
+      <div>Time</div><div>Provider</div><div>Model</div><div>Latency</div><div>Status</div>
+    </div>
+    <template x-for="call in recentCalls" :key="call.timestamp">
+      <div class="log-row">
+        <div class="sub" x-text="new Date(call.timestamp).toLocaleTimeString()"></div>
+        <div class="mono" x-text="call.provider"></div>
+        <div class="mono" x-text="call.model"></div>
+        <div class="sub" x-text="(call.latency_ms || 0) + 'ms'"></div>
+        <div>
+          <span :class="call.error ? 'err-text' : 'ok-text'" x-text="call.error || 'ok'"></span>
+        </div>
+      </div>
+    </template>
+    <div x-show="recentCalls.length === 0" class="sub" style="text-align: center; padding: 1rem;">
+      No calls yet. Point a CLI at <span class="mono">/llm/v1</span> to start capturing.
+    </div>
+  </div>
+</main>
+
+<script>
+function dashboard() {
+  return {
+    version: '0.2.0',
+    token: '',
+    summary: {},
+    grade: {},
+    services: [],
+    recentCalls: [],
+    wikiCount: 0,
+    pendingTasks: 0,
+    sessionsScan: {},
+    skillUsage: [],
+    topFlagType: '—',
+    topFlagCount: 0,
+    lastRefresh: '',
+
+    init() {
+      // Prompt for token
+      this.token = localStorage.getItem('nlr_token') || prompt('API Token (from secrets/.env → NLR_API_TOKEN):') || '';
+      if (this.token) localStorage.setItem('nlr_token', this.token);
+      this.refresh();
+      setInterval(() => this.refresh(), 30000);
+    },
+
+    async api(path) {
+      const resp = await fetch(path, { headers: { Authorization: 'Bearer ' + this.token }});
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    },
+
+    async mcpCall(name, args) {
+      const resp = await fetch('/mcp', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + this.token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', id: 1, params: { name, arguments: args || {} }})
+      });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const d = await resp.json();
+      return JSON.parse(d.result.content[0].text);
+    },
+
+    async refresh() {
+      try {
+        const [summary, grade, calls, pages, tasks, services, sessionsScan, skillUsage] = await Promise.all([
+          this.mcpCall('nlr_llm_logs_summary', { days: 7 }).catch(() => ({})),
+          this.mcpCall('nlr_llm_logs_grade', { days: 7 }).catch(() => ({})),
+          this.mcpCall('nlr_llm_logs_list', { limit: 15 }).catch(() => []),
+          this.mcpCall('nlr_wiki_list', {}).catch(() => []),
+          this.mcpCall('nlr_task_list', { status_filter: 'pending' }).catch(() => []),
+          fetch('/api/v1/services', { headers: { Authorization: 'Bearer ' + this.token }}).then(r => r.ok ? r.json() : { services: []}).catch(() => ({ services: []})),
+          this.mcpCall('nlr_sessions_scan_quality', { days: 7 }).catch(() => ({})),
+          this.mcpCall('nlr_sessions_skill_usage', { days: 30 }).catch(() => []),
+        ]);
+        this.summary = summary;
+        this.grade = grade;
+        this.recentCalls = Array.isArray(calls) ? calls : [];
+        this.wikiCount = Array.isArray(pages) ? pages.length : 0;
+        this.pendingTasks = Array.isArray(tasks) ? tasks.length : 0;
+        this.services = services.services || [];
+        this.sessionsScan = sessionsScan || {};
+        this.skillUsage = Array.isArray(skillUsage) ? skillUsage.slice(0, 10) : [];
+        // Top flag
+        const flags = this.sessionsScan.flags_by_type || {};
+        const entries = Object.entries(flags).sort((a, b) => b[1] - a[1]);
+        if (entries.length > 0) {
+          this.topFlagType = entries[0][0];
+          this.topFlagCount = entries[0][1];
+        } else {
+          this.topFlagType = 'none';
+          this.topFlagCount = 0;
+        }
+        this.lastRefresh = new Date().toLocaleTimeString();
+      } catch (e) {
+        console.error('refresh failed', e);
+      }
+    }
+  };
+}
+</script>
+</body>
+</html>

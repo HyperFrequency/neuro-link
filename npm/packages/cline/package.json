@@ -1,0 +1,27 @@
+{
+  "name": "@neuro-link/cline",
+  "version": "0.2.0",
+  "description": "neuro-link helper for Cline — installs hooks into the Cline VS Code extension config and prints proxy env vars.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HyperFrequency/neuro-link-recursive",
+    "directory": "npm/packages/cline"
+  },
+  "bin": {
+    "neuro-link-cline": "bin/neuro-link-cline.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "_shared/",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js install"
+  },
+  "keywords": ["neuro-link", "cline", "hooks", "mcp", "anthropic"],
+  "engines": {
+    "node": ">=18"
+  }
+}

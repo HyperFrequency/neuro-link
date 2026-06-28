@@ -1,0 +1,30 @@
+{"query": "triple barrier labeling supervised learning", "expected_top1": "swe/quant/triple-barrier-labeling.md"}
+{"query": "transformer architecture attention mechanism", "expected_top1": "ml/transformer-architecture.md"}
+{"query": "RAG systems retrieval augmented generation", "expected_top1": "ml/rag-systems.md"}
+{"query": "django cascade deletion ON_DELETE", "expected_top1": "swe/django/cascade-deletion.md"}
+{"query": "django related fields foreign key", "expected_top1": "swe/django/related-fields.md"}
+{"query": "django migrations autodetector", "expected_top1": "swe/django/migrations-autodetector.md"}
+{"query": "django sql query compiler", "expected_top1": "swe/django/sql-query-compiler.md"}
+{"query": "django url resolvers patterns", "expected_top1": "swe/django/url-resolvers.md"}
+{"query": "rust ownership borrowing rules", "expected_top1": "swe/lang/rust-ownership-borrowing.md"}
+{"query": "rust async tokio executor runtime", "expected_top1": "swe/lang/rust-async-tokio.md"}
+{"query": "rust error handling Result enum", "expected_top1": "swe/lang/rust-error-handling.md"}
+{"query": "python asyncio patterns event loop", "expected_top1": "swe/lang/python-asyncio-patterns.md"}
+{"query": "python typing mypy pydantic", "expected_top1": "swe/lang/python-typing-mypy-pydantic.md"}
+{"query": "cpp RAII smart pointers ownership", "expected_top1": "swe/lang/cpp-raii-smart-pointers.md"}
+{"query": "cpp STL containers vector map", "expected_top1": "swe/lang/cpp-stl-containers.md"}
+{"query": "pine script v6 fundamentals indicators", "expected_top1": "swe/lang/pine-script-v6-fundamentals.md"}
+{"query": "pine script strategy versus indicator", "expected_top1": "swe/lang/pine-script-strategy-vs-indicator.md"}
+{"query": "feature engineering quant", "expected_top1": "swe/quant/feature-engineering.md"}
+{"query": "market microstructure order book", "expected_top1": "swe/quant/market-microstructure.md"}
+{"query": "monte carlo bootstrap simulation", "expected_top1": "swe/quant/monte-carlo-bootstrap.md"}
+{"query": "nautilustrader architecture", "expected_top1": "swe/quant/nautilustrader-architecture.md"}
+{"query": "position sizing kelly criterion", "expected_top1": "swe/quant/position-sizing.md"}
+{"query": "risk metrics sharpe sortino calmar", "expected_top1": "swe/quant/risk-metrics.md"}
+{"query": "transaction cost modeling slippage", "expected_top1": "swe/quant/transaction-cost-modeling.md"}
+{"query": "vectorbt portfolio simulation", "expected_top1": "swe/quant/vectorbt-portfolio-sim.md"}
+{"query": "walk forward analysis cross validation", "expected_top1": "swe/quant/walk-forward-analysis.md"}
+{"query": "backtest bias avoidance lookahead", "expected_top1": "swe/quant/backtest-bias-avoidance.md"}
+{"query": "git workflow swe branching", "expected_top1": "swe/git-workflow-swe.md"}
+{"query": "pytest fixtures debugging", "expected_top1": "swe/pytest-fixtures-debugging.md"}
+{"query": "sympy symbolic debug", "expected_top1": "swe/sympy-symbolic-debug.md"}

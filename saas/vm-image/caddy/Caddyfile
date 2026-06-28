@@ -1,0 +1,38 @@
+# Caddy terminates internal traffic from cloudflared and fans out to services.
+# TLS is handled by Cloudflare at the edge; inside the VM we serve HTTP only.
+#
+# The hostname does not matter here (cloudflared points to 127.0.0.1:80),
+# so we use a site block that matches anything.
+
+{
+    admin off
+    auto_https off
+    servers {
+        protocols h1 h2c
+    }
+}
+
+:80 {
+    # MCP JSON-RPC over HTTP (neuro-link serve exposes /mcp)
+    handle_path /mcp* {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    # neuro-link REST API (status, tasks, wiki reads)
+    handle_path /api/* {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    # Qdrant dashboard (optional, gated by Cloudflare Access in prod)
+    handle_path /qdrant/* {
+        reverse_proxy 127.0.0.1:6333
+    }
+
+    # Neo4j browser (optional, gated by Cloudflare Access in prod)
+    handle_path /neo4j/* {
+        reverse_proxy 127.0.0.1:7474
+    }
+
+    # Default: neuro-link
+    reverse_proxy 127.0.0.1:8080
+}

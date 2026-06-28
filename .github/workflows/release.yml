@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run cargo tests
+        run: cargo test --manifest-path server/Cargo.toml
+
+      - name: Build release binary
+        run: cargo build --release --manifest-path server/Cargo.toml
+
+      - name: E2E smoke test
+        run: |
+          mkdir -p /tmp/nlr-test/{00-raw,01-sorted,02-KB-main,03-ontology-main,07-neuro-link-task,config,state,secrets}
+          echo '---\nversion: 1\nauto_rag: true\n---\n# Config' > /tmp/nlr-test/config/neuro-link.md
+          echo '{"status":"ok","last_check":"2026-01-01T00:00:00Z","errors":[]}' > /tmp/nlr-test/state/heartbeat.json
+          touch /tmp/nlr-test/state/{session_log,score_history,deviation_log}.jsonl
+          echo '---\ntitle: Schema\n---\n# Schema' > /tmp/nlr-test/02-KB-main/schema.md
+          echo '# Index' > /tmp/nlr-test/02-KB-main/index.md
+          echo '# Log' > /tmp/nlr-test/02-KB-main/log.md
+
+          NLR_ROOT=/tmp/nlr-test ./server/target/release/neuro-link serve --port 9999 --token smoketest &
+          sleep 2
+
+          # Health (no auth)
+          curl -sf http://localhost:9999/health | grep -q '"ok"'
+
+          # Auth required
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9999/api/v1/wiki/pages)
+          [ "$STATUS" = "401" ] || (echo "Expected 401, got $STATUS" && exit 1)
+
+          # Authenticated request
+          curl -sf -H "Authorization: Bearer smoketest" http://localhost:9999/api/v1/wiki/pages | grep -q '"pages"'
+
+          # MCP tools/list
+          curl -sf -H "Authorization: Bearer smoketest" -H "Content-Type: application/json" \
+            -X POST http://localhost:9999/mcp \
+            -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' | grep -q '"tools"'
+
+          # Path traversal blocked
+          TRAVERSE=$(curl -s -H "Authorization: Bearer smoketest" -H "Content-Type: application/json" \
+            -X POST http://localhost:9999/mcp \
+            -d '{"jsonrpc":"2.0","method":"resources/read","id":2,"params":{"uri":"nlr://wiki/../../secrets/.env"}}')
+          echo "$TRAVERSE" | grep -q "traversal not allowed"
+
+          kill %1
+          echo "All e2e smoke tests passed"
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: neuro-link-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: neuro-link-darwin-x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: neuro-link-linux-x64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: neuro-link-windows-x64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --manifest-path server/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          src="server/target/${{ matrix.target }}/release/neuro-link"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            src="${src}.exe"
+          fi
+          cp "$src" "${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+
+  obsidian-plugin:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build plugin
+        working-directory: obsidian-plugin
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obsidian-plugin
+          path: |
+            obsidian-plugin/main.js
+            obsidian-plugin/manifest.json
+            obsidian-plugin/styles.css

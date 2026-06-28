@@ -1,0 +1,49 @@
+# ngrok v3 agent config — public edge for TurboVault via Caddy.
+#
+# Usage:
+#   NGROK_DOMAIN=vault.example.ngrok.app ngrok start --config config/ngrok.yml caddy-internal
+#
+# The reserved domain is optional; if unset, ngrok assigns an ephemeral
+# hostname (acceptable for dev, not for anything you want stable URLs for).
+#
+# Prereq: `ngrok config add-authtoken <token>` has been run once on this
+# machine — the authtoken lives in ~/.config/ngrok/ngrok.yml and is NOT
+# duplicated here.
+
+version: "3"
+log_level: info
+log_format: json
+log: stdout
+
+# Disable the local inspection UI (4040) in production — it would expose
+# request bodies (which are token-authenticated RPC calls) to anyone on
+# the host network.
+web_addr: false
+
+tunnels:
+  caddy-internal:
+    proto: http
+    addr: 127.0.0.1:8080
+    # TLS is terminated at the ngrok edge; the tunnel to Caddy is plain HTTP
+    # over an encrypted control channel.
+    schemes:
+      - https
+    # Optional reserved domain — falls back to a random hostname if unset.
+    domain: ${NGROK_DOMAIN}
+    inspect: false
+    # Edge-level rate limit as a second layer behind Caddy's rate_limit.
+    # 120 req/min per IP; Caddy's 60 req/min will hit first, this catches
+    # anything Caddy lets through.
+    request_header:
+      add:
+        - "X-Forwarded-By: ngrok-edge"
+      remove:
+        - "X-Ngrok-Forwarded-For"
+    # Bind TLS cert handling to ngrok's managed cert.
+    bind_tls: true
+    # Restrict to the HTTP methods TurboVault actually uses.
+    # WS upgrade uses GET so this is sufficient.
+    # (Remove this block if ngrok plan doesn't support it.)
+    # ip_restriction:
+    #   allow_cidrs:
+    #     - 0.0.0.0/0

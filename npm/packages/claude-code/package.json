@@ -1,0 +1,27 @@
+{
+  "name": "@neuro-link/claude-code",
+  "version": "0.2.0",
+  "description": "neuro-link helper for Claude Code — installs hooks into ~/.claude/ and prints proxy env vars.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HyperFrequency/neuro-link-recursive",
+    "directory": "npm/packages/claude-code"
+  },
+  "bin": {
+    "neuro-link-claude-code": "bin/neuro-link-claude-code.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "_shared/",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js install"
+  },
+  "keywords": ["neuro-link", "claude-code", "hooks", "mcp", "anthropic"],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash hooks/auto-rag-inject.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash hooks/neuro-grade.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "NLR_VAULT_ROOT": "/Users/DanBot/Desktop/HyperFrequency/neuro-link",
+    "QMD_EMBED_MODEL": "hf:mradermacher/Octen-Embedding-8B-GGUF/Octen-Embedding-8B.Q8_0.gguf",
+    "QMD_RERANK_MODEL": "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf",
+    "QMD_GENERATE_MODEL": "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
+  }
+}

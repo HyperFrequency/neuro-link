@@ -1,0 +1,18 @@
+{
+  "name": "@neuro-link/provisioner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Per-user Fly Machine + Cloudflare Tunnel provisioner for neuro-link-recursive.io",
+  "type": "module",
+  "main": "provision.ts",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}
