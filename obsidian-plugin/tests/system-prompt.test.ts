@@ -64,10 +64,10 @@ describe("SystemPromptLoader", () => {
     expect(loader.lastSource()).toBe("fallback");
   });
 
-  test("always appends the prompt-injection guardrail", () => {
+  test("always appends the untrusted-content guardrail", () => {
     const loader = new SystemPromptLoader({});
     const out = loader.load();
-    expect(out).toContain("Prompt-injection guardrail");
+    expect(out).toContain("Untrusted-content guardrail");
     expect(out).toContain("<tool-result");
   });
 

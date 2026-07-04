@@ -39,7 +39,7 @@ If yes, you're happy regardless of whether every checkbox was ticked. If no,
 explain why and what would have produced a better outcome. Cite log entries
 for each claim.""",
 
-    "red_team": """You are a red-team adversary. For every action that looked fine, look
+    "skeptic": """You are a skeptical critic. For every action that looked fine, look
 harder for what might be subtly wrong: did it silently skip something important?
 Did it create a problem that won't surface until later? Did it over-reach
 beyond its scope? Be skeptical and specific. Cite log entries for each

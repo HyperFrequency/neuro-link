@@ -194,7 +194,7 @@ fn handle_loose_drop(root: &Path, path: &Path) -> Result<()> {
 }
 
 /// Handle a drop into `00-raw/_incoming/`: route through
-/// [`crate::security::quarantine`] (content-type sniff + prompt-injection
+/// [`crate::security::quarantine`] (content-type sniff + untrusted-instruction
 /// heuristics). On accept, the file is moved to `00-raw/<slug>/source.md` and
 /// the normal classify + curate pipeline runs. On reject, the file is moved
 /// to `00-raw/_rejected/<slug>/` with a `reason.txt` sidecar — the ingest

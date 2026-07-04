@@ -28,10 +28,10 @@ result? If yes, you're happy regardless of whether every checkbox was
 ticked. If no, explain why and what would have produced a better outcome.
 ```
 
-### Grader C — The red-team adversary
+### Grader C — The skeptic
 
 ```
-You are a red-team adversary. For every action that looked fine, look
+You are a skeptical critic. For every action that looked fine, look
 harder for what might be subtly wrong: did it silently skip something
 important? Did it create a problem that won't surface until later? Did
 it over-reach beyond its scope? Be skeptical and specific.

@@ -11,7 +11,7 @@
 //! 1. Content-type sniff: markdown/plain UTF-8 only. Binary magic numbers
 //!    (PE, ELF, Mach-O, gzip, zip, PDF, PNG, JPEG, etc.) are rejected.
 //! 2. Size cap: files > 500 KB are rejected (payload-smuggling heuristic).
-//! 3. Prompt-injection heuristics: reject on known jailbreak sigils or
+//! 3. Untrusted-instruction heuristics: reject on known smuggled-instruction markers or
 //!    long streams of blank lines used to bury instructions.
 
 use std::fs;
@@ -64,7 +64,7 @@ pub fn evaluate_and_promote(root: &Path, src: &Path) -> anyhow::Result<Promotion
         }
     };
 
-    // 3. Prompt-injection heuristics.
+    // 3. Untrusted-instruction heuristics.
     if let Some(reason) = detect_injection(text) {
         return finalize_reject(root, src, reason);
     }
@@ -127,7 +127,7 @@ fn detect_binary_magic(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Detect prompt-injection patterns. Returns Some(reason) if suspicious.
+/// Detect untrusted-instruction patterns. Returns Some(reason) if suspicious.
 fn detect_injection(text: &str) -> Option<String> {
     // Exact sigils we always reject (case-insensitive for the sigil text).
     let lower = text.to_lowercase();
